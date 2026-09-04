@@ -22,13 +22,26 @@ def main() -> None:
     parser.add_argument("input_xlsx")
     parser.add_argument("output_xlsx")
     parser.add_argument("--text-col", required=True, help="Название колонки с текстом")
+    parser.add_argument(
+        "--product-col",
+        default=None,
+        help="Название колонки с продуктом (опционально). Используется только как "
+             "контекст в промптах — таксономия классов остаётся общей для всех продуктов.",
+    )
     args = parser.parse_args()
 
     df = pd.read_excel(args.input_xlsx)
     if args.text_col not in df.columns:
         raise SystemExit(f"Колонки '{args.text_col}' нет в файле. Есть: {list(df.columns)}")
+    if args.product_col and args.product_col not in df.columns:
+        raise SystemExit(f"Колонки '{args.product_col}' нет в файле. Есть: {list(df.columns)}")
 
-    rows = list(zip(df.index.tolist(), df[args.text_col].astype(str).tolist()))
+    products = (
+        df[args.product_col].astype(str).tolist()
+        if args.product_col
+        else ["-"] * len(df)
+    )
+    rows = list(zip(df.index.tolist(), products, df[args.text_col].astype(str).tolist()))
 
     print(f"=== Фаза 1: exploratory ({len(rows)} строк) ===")
     candidates = run_exploratory(rows)

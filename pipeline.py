@@ -45,19 +45,25 @@ def _get_embeddings() -> GigaChatEmbeddings:
     )
 
 
-def _batches(rows: list[tuple[int, str]], size: int) -> Iterable[list[tuple[int, str]]]:
+Row = tuple[int, str, str]  # (row_id, product_name, text)
+
+
+def _batches(rows: list[Row], size: int) -> Iterable[list[Row]]:
     for i in range(0, len(rows), size):
         yield rows[i : i + size]
 
 
-def _rows_block(batch: list[tuple[int, str]]) -> str:
-    return "\n".join(f"{rid}: {text}" for rid, text in batch)
+def _rows_block(batch: list[Row]) -> str:
+    # продукт передаётся как контекст, не как отдельное измерение таксономии —
+    # помогает модели не путать одинаково звучащие проблемы у разных продуктов,
+    # но НЕ создаёт per-product классы
+    return "\n".join(f"{rid} [{product}]: {text}" for rid, product, text in batch)
 
 
 # ---------- Фаза 1 ----------
 
-def run_exploratory(rows: list[tuple[int, str]]) -> list[Candidate]:
-    """rows: список (row_id, текст). Возвращает сырых кандидатов классов,
+def run_exploratory(rows: list[Row]) -> list[Candidate]:
+    """rows: список (row_id, продукт, текст). Возвращает сырых кандидатов классов,
     ДО консолидации — там ещё будут дубли, это ожидаемо."""
     llm = _get_llm().with_structured_output(ExploratoryBatchResult)
     known_names: list[str] = []
@@ -144,7 +150,7 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
 # ---------- Фаза 3 ----------
 
 def run_classification(
-    rows: list[tuple[int, str]], taxonomy: Taxonomy
+    rows: list[Row], taxonomy: Taxonomy
 ) -> tuple[dict[int, str], list[TaxonomyClass]]:
     """
     Возвращает (row_id -> assigned_class, список НОВЫХ классов, которые
