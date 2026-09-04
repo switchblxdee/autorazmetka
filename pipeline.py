@@ -25,6 +25,7 @@ from embeddings_cluster import Candidate, cluster_candidates, singleton_candidat
 import prompts
 
 BATCH_SIZE = 25  # для 1k-10k строк ~40-400 вызовов на фазу, разумно
+MAX_RETRIES = 3  # ретраи на батч, если модель не вызвала tool вместо structured output
 
 
 def _get_llm(temperature: float = 0.0) -> GigaChat:
@@ -42,6 +43,34 @@ def _get_embeddings() -> GigaChatEmbeddings:
     return GigaChatEmbeddings(
         credentials=os.environ["GIGACHAT_CREDENTIALS"],
         verify_ssl_certs=False,
+    )
+
+
+def _invoke_structured(llm, messages: list[tuple[str, str]], batch_desc: str):
+    """
+    with_structured_output молча возвращает None, если модель ответила текстом
+    вместо вызова function/tool (типичный сбой на больших/шумных батчах).
+    Ретраим несколько раз, при полном провале - явная ошибка вместо
+    AttributeError на None где-то ниже по коду.
+    """
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            result = llm.invoke(messages)
+        except Exception as e:  # сетевые сбои GigaChat тоже сюда
+            last_exc = e
+            print(f"  [{batch_desc}] попытка {attempt}/{MAX_RETRIES}: ошибка вызова ({e})")
+            continue
+        if result is not None:
+            return result
+        print(
+            f"  [{batch_desc}] попытка {attempt}/{MAX_RETRIES}: "
+            f"модель не вызвала tool, structured output = None, ретраю"
+        )
+    raise RuntimeError(
+        f"Не удалось получить structured output для {batch_desc} "
+        f"после {MAX_RETRIES} попыток. Последняя ошибка: {last_exc}. "
+        f"Возможно, батч слишком большой/шумный - попробуй уменьшить BATCH_SIZE."
     )
 
 
@@ -71,11 +100,13 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
 
     for batch in _batches(rows, BATCH_SIZE):
         existing = ", ".join(known_names) if known_names else "(пока пусто)"
-        result: ExploratoryBatchResult = llm.invoke(
+        result: ExploratoryBatchResult = _invoke_structured(
+            llm,
             [
                 ("system", prompts.EXPLORATORY_SYSTEM.format(existing_classes=existing)),
                 ("user", prompts.EXPLORATORY_USER.format(rows_block=_rows_block(batch))),
-            ]
+            ],
+            batch_desc=f"exploratory batch, rows {batch[0][0]}-{batch[-1][0]}",
         )
         for p in result.proposals:
             candidates.append(Candidate(p.label, p.description, [p.row_id]))
@@ -106,11 +137,13 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
 
     for cluster in clusters:
         cluster_block = "\n".join(f"- {c.name}: {c.description}" for c in cluster)
-        decision: MergeDecision = llm.invoke(
+        decision: MergeDecision = _invoke_structured(
+            llm,
             [
                 ("system", prompts.CONSOLIDATION_SYSTEM),
                 ("user", prompts.CONSOLIDATION_USER.format(cluster_block=cluster_block)),
-            ]
+            ],
+            batch_desc=f"consolidation cluster ({len(cluster)} кандидатов)",
         )
 
         print("\n--- Кластер кандидатов ---")
@@ -163,11 +196,13 @@ def run_classification(
 
     for batch in _batches(rows, BATCH_SIZE):
         taxonomy_block = "\n".join(f"- {c.name}: {c.description}" for c in taxonomy.classes)
-        result: ClassificationBatchResult = llm.invoke(
+        result: ClassificationBatchResult = _invoke_structured(
+            llm,
             [
                 ("system", prompts.CLASSIFICATION_SYSTEM.format(taxonomy_block=taxonomy_block)),
                 ("user", prompts.CLASSIFICATION_USER.format(rows_block=_rows_block(batch))),
-            ]
+            ],
+            batch_desc=f"classification batch, rows {batch[0][0]}-{batch[-1][0]}",
         )
         for r in result.results:
             if r.assigned_class:
