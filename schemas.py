@@ -27,15 +27,21 @@ class ProposedLabel(BaseModel):
 
 
 class ExploratoryBatchResult(BaseModel):
-    proposals: list[ProposedLabel]
+    """Результат разметки одного батча строк на фазе exploratory."""
+    proposals: list[ProposedLabel] = Field(
+        description="Предложение класса для каждой строки батча, по одному на строку"
+    )
 
 
 # ---------- Фаза 2: consolidation (дедуп таксономии) ----------
 
 class TaxonomyClass(BaseModel):
-    name: str
-    description: str
-    example_row_ids: list[int] = Field(default_factory=list)
+    """Один класс итоговой таксономии."""
+    name: str = Field(description="Каноничное название класса")
+    description: str = Field(description="Определение класса, отличающее его от похожих")
+    example_row_ids: list[int] = Field(
+        default_factory=list, description="ID строк-примеров этого класса"
+    )
     aliases: list[str] = Field(
         default_factory=list,
         description="Прежние названия, которые были смерджены в этот класс"
@@ -43,7 +49,10 @@ class TaxonomyClass(BaseModel):
 
 
 class Taxonomy(BaseModel):
-    classes: list[TaxonomyClass] = Field(default_factory=list)
+    """Полная таксономия классов на текущий момент."""
+    classes: list[TaxonomyClass] = Field(
+        default_factory=list, description="Список всех классов таксономии"
+    )
 
     def names(self) -> list[str]:
         return [c.name for c in self.classes]
@@ -58,14 +67,17 @@ class MergeDecision(BaseModel):
     canonical_name: Optional[str] = Field(
         default=None, description="Итоговое каноничное имя, если is_same_class=True"
     )
-    canonical_description: Optional[str] = Field(default=None)
+    canonical_description: Optional[str] = Field(
+        default=None, description="Итоговое описание класса, если is_same_class=True"
+    )
     reasoning: str = Field(description="Короткое обоснование решения")
 
 
 # ---------- Фаза 3: classification (финальная разметка) ----------
 
 class ClassificationResult(BaseModel):
-    row_id: int
+    """Результат классификации одной строки."""
+    row_id: int = Field(description="ID строки, к которой относится результат")
     assigned_class: Optional[str] = Field(
         default=None,
         description="Имя класса СТРОГО из переданного списка существующих классов, "
@@ -76,9 +88,14 @@ class ClassificationResult(BaseModel):
         description="Заполняется ТОЛЬКО если ни один существующий класс не подходит "
                     "по смыслу (не по формулировке). Иначе оставить null."
     )
-    propose_new_description: Optional[str] = None
+    propose_new_description: Optional[str] = Field(
+        default=None, description="Определение нового класса, если propose_new_class заполнен"
+    )
     justification: str = Field(description="Почему выбран этот класс / почему нужен новый")
 
 
 class ClassificationBatchResult(BaseModel):
-    results: list[ClassificationResult]
+    """Результат классификации одного батча строк."""
+    results: list[ClassificationResult] = Field(
+        description="Результат классификации для каждой строки батча, по одному на строку"
+    )
