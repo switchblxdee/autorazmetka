@@ -46,17 +46,30 @@ def _get_embeddings() -> GigaChatEmbeddings:
     )
 
 
-def _invoke_structured(llm, messages: list[tuple[str, str]], batch_desc: str):
+def _invoke_structured(llm, messages: list[tuple[str, str]], batch_desc: str, llm_raw=None):
     """
     with_structured_output молча возвращает None, если модель ответила текстом
-    вместо вызова function/tool (типичный сбой на больших/шумных батчах).
-    Ретраим несколько раз, при полном провале - явная ошибка вместо
-    AttributeError на None где-то ниже по коду.
+    вместо вызова function/tool (типичный сбой GigaChat даже с форсированным
+    tool_choice - см. обсуждение в чате: вероятность сбоя примерно постоянна
+    на запрос, не зависит от размера батча).
+
+    llm_raw: тот же llm, но с with_structured_output(schema, include_raw=True) -
+    используется на последней попытке, чтобы увидеть сырой ответ модели
+    и понять, ЧТО именно она написала вместо вызова tool.
     """
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
+        is_last = attempt == MAX_RETRIES
         try:
-            result = llm.invoke(messages)
+            if is_last and llm_raw is not None:
+                raw_result = llm_raw.invoke(messages)
+                result = raw_result.get("parsed")
+                if result is None:
+                    print(f"  [{batch_desc}] сырой ответ модели на провалившейся попытке:")
+                    print(f"    {raw_result.get('raw')}")
+                    print(f"    parsing_error: {raw_result.get('parsing_error')}")
+            else:
+                result = llm.invoke(messages)
         except Exception as e:  # сетевые сбои GigaChat тоже сюда
             last_exc = e
             print(f"  [{batch_desc}] попытка {attempt}/{MAX_RETRIES}: ошибка вызова ({e})")
@@ -70,7 +83,7 @@ def _invoke_structured(llm, messages: list[tuple[str, str]], batch_desc: str):
     raise RuntimeError(
         f"Не удалось получить structured output для {batch_desc} "
         f"после {MAX_RETRIES} попыток. Последняя ошибка: {last_exc}. "
-        f"Возможно, батч слишком большой/шумный - попробуй уменьшить BATCH_SIZE."
+        f"Смотри сырой ответ модели выше - это подскажет, ЧТО она вместо этого написала."
     )
 
 
@@ -95,6 +108,7 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
     """rows: список (row_id, продукт, текст). Возвращает сырых кандидатов классов,
     ДО консолидации — там ещё будут дубли, это ожидаемо."""
     llm = _get_llm().with_structured_output(ExploratoryBatchResult)
+    llm_raw = _get_llm().with_structured_output(ExploratoryBatchResult, include_raw=True)
     known_names: list[str] = []
     candidates: list[Candidate] = []
 
@@ -107,6 +121,7 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
                 ("user", prompts.EXPLORATORY_USER.format(rows_block=_rows_block(batch))),
             ],
             batch_desc=f"exploratory batch, rows {batch[0][0]}-{batch[-1][0]}",
+            llm_raw=llm_raw,
         )
         for p in result.proposals:
             candidates.append(Candidate(p.label, p.description, [p.row_id]))
@@ -116,7 +131,41 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
     return candidates
 
 
+EMBED_BATCH_SIZE = 50  # GigaChat Embeddings отдаёт 500 на слишком больших батчах
+
+
+def _embed_texts(embed: GigaChatEmbeddings, texts: list[str]) -> np.ndarray:
+    """
+    Батчим запросы к эмбеддеру: GigaChat отвечает 500 (а не внятным 413/400),
+    если в один запрос уйдёт слишком длинный список. На 1k-10k строк
+    exploratory даёт сопоставимое число кандидатов, одним запросом не влезает.
+    """
+    vectors: list[list[float]] = []
+    total = (len(texts) + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        chunk = texts[i : i + EMBED_BATCH_SIZE]
+        print(f"  эмбеддинги: батч {i // EMBED_BATCH_SIZE + 1}/{total} ({len(chunk)} шт.)")
+        vectors.extend(embed.embed_documents(chunk))
+    return np.array(vectors)
+
+
 # ---------- Фаза 2 (human-in-the-loop) ----------
+
+def _dedup_candidates(candidates: list[Candidate]) -> list[Candidate]:
+    """
+    Точные дубли по имени схлопываем ДО эмбеддинга - модель на большом
+    датасете предлагает один и тот же класс сотни раз, эмбедить его
+    столько же раз бессмысленно и дорого.
+    """
+    by_name: dict[str, Candidate] = {}
+    for c in candidates:
+        key = c.name.strip().lower()
+        if key in by_name:
+            by_name[key].source_row_ids.extend(c.source_row_ids)
+        else:
+            by_name[key] = Candidate(c.name, c.description, list(c.source_row_ids))
+    return list(by_name.values())
+
 
 def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
     """
@@ -125,14 +174,22 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
     2. решение показывается тебе в консоли на подтверждение,
     3. только после твоего "да" оно применяется.
     """
+    candidates = _dedup_candidates(candidates)
+    print(f"После схлопывания точных дублей осталось {len(candidates)} уникальных кандидатов")
+
     embed = _get_embeddings()
-    texts = [f"{c.name}: {c.description}" for c in candidates]
-    vectors = np.array(embed.embed_documents(texts))
+    # пустое описание -> вырожденная строка "name: ", GigaChat такое не любит
+    texts = [
+        f"{c.name}: {c.description}".strip().rstrip(":").strip() or c.name
+        for c in candidates
+    ]
+    vectors = _embed_texts(embed, texts)
 
     clusters = cluster_candidates(candidates, vectors)
     singles = singleton_candidates(candidates, vectors)
 
     llm = _get_llm().with_structured_output(MergeDecision)
+    llm_raw = _get_llm().with_structured_output(MergeDecision, include_raw=True)
     taxonomy = Taxonomy()
 
     for cluster in clusters:
@@ -144,6 +201,7 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
                 ("user", prompts.CONSOLIDATION_USER.format(cluster_block=cluster_block)),
             ],
             batch_desc=f"consolidation cluster ({len(cluster)} кандидатов)",
+            llm_raw=llm_raw,
         )
 
         print("\n--- Кластер кандидатов ---")
@@ -191,6 +249,7 @@ def run_classification(
     ещё раз, если их набралось много, см. main.py).
     """
     llm = _get_llm().with_structured_output(ClassificationBatchResult)
+    llm_raw = _get_llm().with_structured_output(ClassificationBatchResult, include_raw=True)
     assignments: dict[int, str] = {}
     new_classes: list[TaxonomyClass] = []
 
@@ -203,6 +262,7 @@ def run_classification(
                 ("user", prompts.CLASSIFICATION_USER.format(rows_block=_rows_block(batch))),
             ],
             batch_desc=f"classification batch, rows {batch[0][0]}-{batch[-1][0]}",
+            llm_raw=llm_raw,
         )
         for r in result.results:
             if r.assigned_class:
