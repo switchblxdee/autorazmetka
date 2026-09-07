@@ -124,6 +124,10 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
             llm_raw=llm_raw,
         )
         for p in result.proposals:
+            if not p.is_issue or p.label.strip().upper() == "NO_ISSUE":
+                # NO_ISSUE не должен попасть в таксономию и в кластеризацию -
+                # это не класс проблемы, а признак её отсутствия
+                continue
             candidates.append(Candidate(p.label, p.description, [p.row_id]))
             if p.label not in known_names:
                 known_names.append(p.label)
