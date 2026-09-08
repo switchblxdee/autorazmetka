@@ -24,23 +24,19 @@ def main() -> None:
     parser.add_argument("--text-col", required=True, help="Название колонки с текстом")
     parser.add_argument(
         "--product-col",
-        default=None,
-        help="Название колонки с продуктом (опционально). Используется только как "
-             "контекст в промптах — таксономия классов остаётся общей для всех продуктов.",
+        required=True,
+        help="Название колонки с продуктом. ОБЯЗАТЕЛЬНА: классы имеют формат "
+             "'Продукт: Проблема', таксономия строится отдельно по каждому продукту.",
     )
     args = parser.parse_args()
 
     df = pd.read_excel(args.input_xlsx)
     if args.text_col not in df.columns:
         raise SystemExit(f"Колонки '{args.text_col}' нет в файле. Есть: {list(df.columns)}")
-    if args.product_col and args.product_col not in df.columns:
+    if args.product_col not in df.columns:
         raise SystemExit(f"Колонки '{args.product_col}' нет в файле. Есть: {list(df.columns)}")
 
-    products = (
-        df[args.product_col].astype(str).tolist()
-        if args.product_col
-        else ["-"] * len(df)
-    )
+    products = df[args.product_col].astype(str).tolist()
     rows = list(zip(df.index.tolist(), products, df[args.text_col].astype(str).tolist()))
 
     print(f"=== Фаза 1: exploratory ({len(rows)} строк) ===")
@@ -50,9 +46,14 @@ def main() -> None:
     print("\n=== Фаза 2: consolidation (нужно твоё подтверждение по кластерам) ===")
     taxonomy = run_consolidation(candidates)
     print(f"\nИтоговая таксономия: {len(taxonomy.classes)} классов")
+    by_product: dict[str, list] = {}
     for c in taxonomy.classes:
-        alias_note = f" (было: {', '.join(c.aliases)})" if c.aliases else ""
-        print(f"  - {c.name}{alias_note}")
+        by_product.setdefault(c.product, []).append(c)
+    for product, classes in sorted(by_product.items()):
+        print(f"  [{product}] — {len(classes)} классов:")
+        for c in classes:
+            alias_note = f" (было: {', '.join(c.aliases)})" if c.aliases else ""
+            print(f"    - {c.name}{alias_note}")
 
     print(f"\n=== Фаза 3: classification ===")
     assignments, new_classes = run_classification(rows, taxonomy)

@@ -15,20 +15,24 @@ from pydantic import BaseModel, Field
 class ProposedLabel(BaseModel):
     """Одно предложение класса для одной строки в батче."""
     row_id: int = Field(description="ID строки, к которой относится предложение")
+    product: str = Field(
+        description="Название продукта из квадратных скобок, ДОСЛОВНО как в строке"
+    )
     extracted_problem: str = Field(
-        description="Суть проблемы, извлечённая из текста: что именно пошло не так. "
-                    "Без названия продукта, версии, имени пользователя и цитат из текста. "
-                    "Заполняется ПЕРВЫМ, до выбора класса. Если проблемы нет - 'нет проблемы'."
+        description="Суть проблемы: что именно пошло не так и при каком действии. "
+                    "Сохраняй точные коды и технические формулировки из текста "
+                    "(401, timeout, connection refused). Заполняется ПЕРВЫМ, до label. "
+                    "Если проблемы нет - 'нет проблемы'."
     )
     is_issue: bool = Field(
         description="False, если в строке нет проблемы (благодарность, приветствие, "
                     "нейтральный факт, чистый вопрос без жалобы). Тогда label='NO_ISSUE'."
     )
     label: str = Field(
-        description="Название класса: 2-5 слов в форме 'объект + что с ним не так' "
-                    "(например 'Ошибка аутентификации', 'Долгая загрузка интерфейса'). "
-                    "Не название продукта, не пересказ строки, не одно общее слово "
-                    "вроде 'Ошибка' или 'Проблема'. Если is_issue=false - 'NO_ISSUE'."
+        description="Название класса СТРОГО в формате 'Продукт: Проблема', например "
+                    "'Jenkins-MCP: Ошибка 401' или 'GigaCode: Timeout при запросе'. "
+                    "Часть после двоеточия сохраняет точный код/формулировку из текста. "
+                    "Если is_issue=false - просто 'NO_ISSUE' без префикса продукта."
     )
     description: str = Field(
         description="1-2 предложения: какие кейсы попадают в этот класс, а какие - НЕТ. "
@@ -51,7 +55,12 @@ class ExploratoryBatchResult(BaseModel):
 
 class TaxonomyClass(BaseModel):
     """Один класс итоговой таксономии."""
-    name: str = Field(description="Каноничное название класса")
+    name: str = Field(description="Каноничное название класса в формате 'Продукт: Проблема'")
+    product: str = Field(
+        default="-",
+        description="Продукт, к которому привязан класс. Консолидация сливает "
+                    "классы только внутри одного продукта."
+    )
     description: str = Field(description="Определение класса, отличающее его от похожих")
     example_row_ids: list[int] = Field(
         default_factory=list, description="ID строк-примеров этого класса"
@@ -70,6 +79,11 @@ class Taxonomy(BaseModel):
 
     def names(self) -> list[str]:
         return [c.name for c in self.classes]
+
+    def for_product(self, product: str) -> list[TaxonomyClass]:
+        """Классы конкретного продукта — таксономия теперь продукт-специфична,
+        показывать модели чужие классы бессмысленно и вредно."""
+        return [c for c in self.classes if c.product == product]
 
 
 class MergeDecision(BaseModel):

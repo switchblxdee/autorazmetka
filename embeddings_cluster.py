@@ -21,6 +21,20 @@ class Candidate:
     name: str
     description: str
     source_row_ids: list[int]
+    product: str = "-"
+
+
+def group_by_product(candidates: list[Candidate]) -> dict[str, list[Candidate]]:
+    """
+    Консолидация идёт только внутри одного продукта, поэтому кандидаты
+    сначала разбиваются по продукту, и кластеризация запускается на каждой
+    группе отдельно. Иначе 'Jenkins-MCP: Ошибка 401' и 'Atlassian-MCP: Ошибка 401'
+    склеились бы в один класс - продукт из имени потерялся бы.
+    """
+    groups: dict[str, list[Candidate]] = {}
+    for c in candidates:
+        groups.setdefault(c.product, []).append(c)
+    return groups
 
 
 def cosine_sim_matrix(vectors: np.ndarray) -> np.ndarray:

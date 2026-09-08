@@ -21,7 +21,9 @@ from schemas import (
     MergeDecision,
     ClassificationBatchResult,
 )
-from embeddings_cluster import Candidate, cluster_candidates, singleton_candidates
+from embeddings_cluster import (
+    Candidate, cluster_candidates, singleton_candidates, group_by_product
+)
 import prompts
 
 BATCH_SIZE = 25  # для 1k-10k строк ~40-400 вызовов на фазу, разумно
@@ -128,7 +130,9 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
                 # NO_ISSUE не должен попасть в таксономию и в кластеризацию -
                 # это не класс проблемы, а признак её отсутствия
                 continue
-            candidates.append(Candidate(p.label, p.description, [p.row_id]))
+            candidates.append(
+                Candidate(p.label, p.description, [p.row_id], p.product)
+            )
             if p.label not in known_names:
                 known_names.append(p.label)
 
@@ -160,19 +164,25 @@ def _dedup_candidates(candidates: list[Candidate]) -> list[Candidate]:
     Точные дубли по имени схлопываем ДО эмбеддинга - модель на большом
     датасете предлагает один и тот же класс сотни раз, эмбедить его
     столько же раз бессмысленно и дорого.
+    Ключ включает продукт: классы теперь продукт-специфичны.
     """
-    by_name: dict[str, Candidate] = {}
+    by_name: dict[tuple[str, str], Candidate] = {}
     for c in candidates:
-        key = c.name.strip().lower()
+        key = (c.product.strip().lower(), c.name.strip().lower())
         if key in by_name:
             by_name[key].source_row_ids.extend(c.source_row_ids)
         else:
-            by_name[key] = Candidate(c.name, c.description, list(c.source_row_ids))
+            by_name[key] = Candidate(
+                c.name, c.description, list(c.source_row_ids), c.product
+            )
     return list(by_name.values())
 
 
 def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
     """
+    Консолидация идёт ОТДЕЛЬНО по каждому продукту: классы разных продуктов
+    никогда не сливаются между собой, даже если проблема одинаковая.
+
     Для каждого кластера похожих кандидатов:
     1. LLM предлагает merge-решение,
     2. решение показывается тебе в консоли на подтверждение,
@@ -182,62 +192,91 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
     print(f"После схлопывания точных дублей осталось {len(candidates)} уникальных кандидатов")
 
     embed = _get_embeddings()
-    # пустое описание -> вырожденная строка "name: ", GigaChat такое не любит
-    texts = [
-        f"{c.name}: {c.description}".strip().rstrip(":").strip() or c.name
-        for c in candidates
-    ]
-    vectors = _embed_texts(embed, texts)
-
-    clusters = cluster_candidates(candidates, vectors)
-    singles = singleton_candidates(candidates, vectors)
-
     llm = _get_llm().with_structured_output(MergeDecision)
     llm_raw = _get_llm().with_structured_output(MergeDecision, include_raw=True)
     taxonomy = Taxonomy()
 
-    for cluster in clusters:
-        cluster_block = "\n".join(f"- {c.name}: {c.description}" for c in cluster)
-        decision: MergeDecision = _invoke_structured(
-            llm,
-            [
-                ("system", prompts.CONSOLIDATION_SYSTEM),
-                ("user", prompts.CONSOLIDATION_USER.format(cluster_block=cluster_block)),
-            ],
-            batch_desc=f"consolidation cluster ({len(cluster)} кандидатов)",
-            llm_raw=llm_raw,
-        )
+    groups = group_by_product(candidates)
+    print(f"Продуктов в данных: {len(groups)}")
 
-        print("\n--- Кластер кандидатов ---")
-        print(cluster_block)
-        print(f"\nМодель предлагает: is_same_class={decision.is_same_class}")
-        if decision.is_same_class:
-            print(f"  -> canonical_name: {decision.canonical_name}")
-            print(f"  -> description: {decision.canonical_description}")
-        print(f"  -> reasoning: {decision.reasoning}")
-        confirm = input("Применить это решение? [y/n/e(edit name)]: ").strip().lower()
+    for product, product_candidates in groups.items():
+        print(f"\n=== Продукт '{product}': {len(product_candidates)} кандидатов ===")
 
-        if confirm == "n":
-            # оставляем кандидатов как отдельные классы без мерджа
-            for c in cluster:
-                taxonomy.classes.append(TaxonomyClass(name=c.name, description=c.description))
+        if len(product_candidates) == 1:
+            c = product_candidates[0]
+            taxonomy.classes.append(
+                TaxonomyClass(
+                    name=c.name, product=product, description=c.description,
+                    example_row_ids=c.source_row_ids,
+                )
+            )
             continue
 
-        name = decision.canonical_name or cluster[0].name
-        desc = decision.canonical_description or cluster[0].description
-        if confirm == "e":
-            name = input(f"Новое имя (было '{name}'): ").strip() or name
+        # пустое описание -> вырожденная строка "name: ", GigaChat такое не любит
+        texts = [
+            f"{c.name}: {c.description}".strip().rstrip(":").strip() or c.name
+            for c in product_candidates
+        ]
+        vectors = _embed_texts(embed, texts)
 
-        aliases = [c.name for c in cluster if c.name != name]
-        all_row_ids = [rid for c in cluster for rid in c.source_row_ids]
-        taxonomy.classes.append(
-            TaxonomyClass(name=name, description=desc, example_row_ids=all_row_ids, aliases=aliases)
-        )
+        clusters = cluster_candidates(product_candidates, vectors)
+        singles = singleton_candidates(product_candidates, vectors)
 
-    for c in singles:
-        taxonomy.classes.append(
-            TaxonomyClass(name=c.name, description=c.description, example_row_ids=c.source_row_ids)
-        )
+        for cluster in clusters:
+            cluster_block = "\n".join(f"- {c.name}: {c.description}" for c in cluster)
+            decision: MergeDecision = _invoke_structured(
+                llm,
+                [
+                    ("system", prompts.CONSOLIDATION_SYSTEM),
+                    ("user", prompts.CONSOLIDATION_USER.format(
+                        product=product, cluster_block=cluster_block
+                    )),
+                ],
+                batch_desc=f"consolidation '{product}' ({len(cluster)} кандидатов)",
+                llm_raw=llm_raw,
+            )
+
+            print(f"\n--- Кластер кандидатов [{product}] ---")
+            print(cluster_block)
+            print(f"\nМодель предлагает: is_same_class={decision.is_same_class}")
+            if decision.is_same_class:
+                print(f"  -> canonical_name: {decision.canonical_name}")
+                print(f"  -> description: {decision.canonical_description}")
+            print(f"  -> reasoning: {decision.reasoning}")
+            confirm = input("Применить это решение? [y/n/e(edit name)]: ").strip().lower()
+
+            if confirm == "n":
+                # оставляем кандидатов как отдельные классы без мерджа
+                for c in cluster:
+                    taxonomy.classes.append(
+                        TaxonomyClass(
+                            name=c.name, product=product, description=c.description,
+                            example_row_ids=c.source_row_ids,
+                        )
+                    )
+                continue
+
+            name = decision.canonical_name or cluster[0].name
+            desc = decision.canonical_description or cluster[0].description
+            if confirm == "e":
+                name = input(f"Новое имя (было '{name}'): ").strip() or name
+
+            aliases = [c.name for c in cluster if c.name != name]
+            all_row_ids = [rid for c in cluster for rid in c.source_row_ids]
+            taxonomy.classes.append(
+                TaxonomyClass(
+                    name=name, product=product, description=desc,
+                    example_row_ids=all_row_ids, aliases=aliases,
+                )
+            )
+
+        for c in singles:
+            taxonomy.classes.append(
+                TaxonomyClass(
+                    name=c.name, product=product, description=c.description,
+                    example_row_ids=c.source_row_ids,
+                )
+            )
 
     return taxonomy
 
@@ -257,35 +296,55 @@ def run_classification(
     assignments: dict[int, str] = {}
     new_classes: list[TaxonomyClass] = []
 
-    for batch in _batches(rows, BATCH_SIZE):
-        taxonomy_block = "\n".join(f"- {c.name}: {c.description}" for c in taxonomy.classes)
-        result: ClassificationBatchResult = _invoke_structured(
-            llm,
-            [
-                ("system", prompts.CLASSIFICATION_SYSTEM.format(taxonomy_block=taxonomy_block)),
-                ("user", prompts.CLASSIFICATION_USER.format(rows_block=_rows_block(batch))),
-            ],
-            batch_desc=f"classification batch, rows {batch[0][0]}-{batch[-1][0]}",
-            llm_raw=llm_raw,
-        )
-        for r in result.results:
-            if r.assigned_class:
-                assignments[r.row_id] = r.assigned_class
-            elif r.propose_new_class:
-                print(f"\n[row {r.row_id}] Предложен НОВЫЙ класс: {r.propose_new_class}")
-                print(f"  justification: {r.justification}")
-                confirm = input("Создать новый класс в таксономии? [y/n]: ").strip().lower()
-                if confirm == "y":
-                    new_cls = TaxonomyClass(
-                        name=r.propose_new_class,
-                        description=r.propose_new_description or "",
-                        example_row_ids=[r.row_id],
-                    )
-                    taxonomy.classes.append(new_cls)
-                    new_classes.append(new_cls)
-                    assignments[r.row_id] = new_cls.name
-                else:
-                    # fallback: просим человека назначить руками или помечаем как unresolved
-                    assignments[r.row_id] = "UNRESOLVED"
+    # группируем строки по продукту: таксономия продукт-специфична, показывать
+    # модели классы чужих продуктов бессмысленно и провоцирует ошибки
+    by_product: dict[str, list[Row]] = {}
+    for row in rows:
+        by_product.setdefault(row[1], []).append(row)
+
+    for product, product_rows in by_product.items():
+        product_classes = taxonomy.for_product(product)
+        print(f"\n--- Классификация '{product}': {len(product_rows)} строк, "
+              f"{len(product_classes)} классов ---")
+
+        for batch in _batches(product_rows, BATCH_SIZE):
+            # пересобираем блок на каждом батче: новые классы могли добавиться
+            taxonomy_block = "\n".join(
+                f"- {c.name}: {c.description}" for c in taxonomy.for_product(product)
+            ) or "(классов для этого продукта пока нет)"
+            result: ClassificationBatchResult = _invoke_structured(
+                llm,
+                [
+                    ("system", prompts.CLASSIFICATION_SYSTEM.format(
+                        product=product, taxonomy_block=taxonomy_block
+                    )),
+                    ("user", prompts.CLASSIFICATION_USER.format(
+                        product=product, rows_block=_rows_block(batch)
+                    )),
+                ],
+                batch_desc=f"classification '{product}', rows {batch[0][0]}-{batch[-1][0]}",
+                llm_raw=llm_raw,
+            )
+            for r in result.results:
+                if r.assigned_class:
+                    assignments[r.row_id] = r.assigned_class
+                elif r.propose_new_class:
+                    print(f"\n[row {r.row_id}] [{product}] Предложен НОВЫЙ класс: "
+                          f"{r.propose_new_class}")
+                    print(f"  justification: {r.justification}")
+                    confirm = input("Создать новый класс в таксономии? [y/n]: ").strip().lower()
+                    if confirm == "y":
+                        new_cls = TaxonomyClass(
+                            name=r.propose_new_class,
+                            product=product,
+                            description=r.propose_new_description or "",
+                            example_row_ids=[r.row_id],
+                        )
+                        taxonomy.classes.append(new_cls)
+                        new_classes.append(new_cls)
+                        assignments[r.row_id] = new_cls.name
+                    else:
+                        # fallback: помечаем как unresolved, назначишь руками
+                        assignments[r.row_id] = "UNRESOLVED"
 
     return assignments, new_classes
