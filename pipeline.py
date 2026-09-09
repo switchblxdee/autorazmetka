@@ -139,6 +139,7 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
                 llm,
                 [
                     ("system", prompts.EXPLORATORY_SYSTEM.format(
+                        methodology=prompts.METHODOLOGY,
                         product=product,
                         existing_classes=existing,
                         existing_count=len(known),
