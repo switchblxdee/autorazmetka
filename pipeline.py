@@ -206,12 +206,11 @@ def _complete_batch(llm, llm_raw, batch, make_messages, extract, batch_desc):
 
 # ---------- Фаза 1 ----------
 
-def run_exploratory(rows: list[Row]) -> tuple[list[Candidate], dict[int, str]]:
+def run_exploratory(rows: list[Row]) -> list[Candidate]:
     """rows: список (row_id, продукт, текст).
 
-    Возвращает (кандидаты классов, служебные строки). Кандидаты — ДО
-    консолидации, там ещё будут дубли, это ожидаемо. Служебные строки —
-    те, где проблемы нет: {row_id: POSITIVE | NO_SUBJECT | IRRELEVANT}.
+    Возвращает кандидатов классов ДО консолидации — там ещё будут дубли,
+    это ожидаемо. Класс получает КАЖДАЯ строка, служебных корзин нет.
 
     Идём ПО ПРОДУКТАМ и показываем модели классы только текущего продукта,
     с описаниями. Плоский список всех классов всех продуктов (как было раньше)
@@ -221,11 +220,6 @@ def run_exploratory(rows: list[Row]) -> tuple[list[Candidate], dict[int, str]]:
     llm = _get_llm().with_structured_output(ExploratoryBatchResult)
     llm_raw = _get_llm().with_structured_output(ExploratoryBatchResult, include_raw=True)
     candidates: list[Candidate] = []
-    # строки, которые не несут проблемы: row_id -> POSITIVE / NO_SUBJECT / IRRELEVANT.
-    # Их нельзя терять - методология требует держать их в данных (раздел 7),
-    # просто в таксономию тем они не входят.
-    service_rows: dict[int, str] = {}
-    kind_counts: dict[str, int] = {}
     unresolved_rows: set[int] = set()
 
     for product, product_rows in _group_rows_by_product(rows).items():
@@ -259,13 +253,6 @@ def run_exploratory(rows: list[Row]) -> tuple[list[Candidate], dict[int, str]]:
                 lambda r: r.proposals, batch_desc,
             )
             for real_row_id, p in mapped.items():
-                kind_counts[p.kind] = kind_counts.get(p.kind, 0) + 1
-                if p.kind != "issue":
-                    # positive / no_subject / irrelevant в таксономию не идут:
-                    # это не классы проблем. Разделение на три служебных вида —
-                    # из методологии (раздел 7), поэтому не схлопываем их в один.
-                    service_rows[real_row_id] = p.kind.upper()
-                    continue
                 candidates.append(
                     Candidate(p.label, p.description, [real_row_id], product)
                 )
@@ -279,15 +266,13 @@ def run_exploratory(rows: list[Row]) -> tuple[list[Candidate], dict[int, str]]:
 
         print(f"  → уникальных классов у '{product}': {len(known)}")
 
-    if kind_counts:
-        print(f"\nРазбивка по видам строк: {kind_counts}")
-    covered = sum(kind_counts.values())
-    print(f"Покрытие фазы 1: {covered} из {len(rows)} строк")
+    covered = len({rid for c in candidates for rid in c.source_row_ids})
+    print(f"\nПокрытие фазы 1: {covered} из {len(rows)} строк")
     if unresolved_rows:
         print(f"  [!] не удалось разобрать {len(unresolved_rows)} строк: "
               f"{sorted(unresolved_rows)[:20]}")
 
-    return candidates, service_rows
+    return candidates
 
 
 EMBED_BATCH_SIZE = 50  # GigaChat Embeddings отдаёт 500 на слишком больших батчах
@@ -501,12 +486,8 @@ def run_classification(
                         # fallback: помечаем как unresolved, назначишь руками
                         assignments[real_row_id] = "UNRESOLVED"
                 else:
-                    # модель не дала ни класса, ни предложения. Раньше такая
-                    # строка молча выпадала из assignments и приходила в xlsx
-                    # пустой ячейкой - теперь помечаем явно и различаем причину.
-                    assignments[real_row_id] = (
-                        "NO_ISSUE" if not r.is_issue else "NO_CLASS"
-                    )
+                    # модель не дала ни класса, ни предложения
+                    assignments[real_row_id] = "NO_CLASS"
 
             # строки, не закрывшиеся даже поштучным добиванием
             for rid, _, _ in batch:

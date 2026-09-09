@@ -6,7 +6,7 @@
 только выбрать из известного enum или явно запросить новый класс.
 """
 from __future__ import annotations
-from typing import Literal, Optional
+from typing import Optional
 from pydantic import BaseModel, Field
 
 
@@ -23,25 +23,17 @@ class ProposedLabel(BaseModel):
         description="Название продукта из квадратных скобок, ДОСЛОВНО как в строке"
     )
     quote: str = Field(
-        description="ДОСЛОВНЫЙ фрагмент текста отзыва, который называет и предмет "
-                    "проблемы, и её дефект. Побуквенно как в тексте, вместе с опечатками "
-                    "и авторской пунктуацией. НЕ пересказ. Пустая строка допустима ТОЛЬКО "
-                    "при kind='no_subject' - там называть нечего."
+        description="ДОСЛОВНЫЙ фрагмент текста отзыва, на котором основан класс. "
+                    "Побуквенно как в тексте, вместе с опечатками и авторской "
+                    "пунктуацией. НЕ пересказ."
     )
     extracted_problem: str = Field(
-        description="Суть проблемы своими словами: что сломалось и на каком действии. "
+        description="Суть обращения своими словами: что сломалось и на каком действии. "
                     "Коды и тип сбоя сохраняй, обстоятельства (ОС, версия, ник) отбрасывай."
     )
-    kind: Literal["issue", "positive", "no_subject", "irrelevant"] = Field(
-        description="issue - названа конкретная проблема; positive - похвала или 'всё "
-                    "устраивает'; no_subject - оценка без названного предмета ('ужасно', "
-                    "'бывают сбои') - непонятно, что чинить; irrelevant - не про продукт, "
-                    "про сам опрос, пустой ответ."
-    )
     label: str = Field(
-        description="Название класса СТРОГО в формате 'Продукт: Проблема'. "
-                    "Если kind != 'issue' - служебное имя без префикса: "
-                    "'POSITIVE', 'NO_SUBJECT' или 'IRRELEVANT'."
+        description="Название класса СТРОГО в формате 'Продукт: Суть'. "
+                    "Класс нужен для КАЖДОЙ строки без исключения."
     )
     description: str = Field(
         description="1-2 предложения: какие кейсы попадают в этот класс, а какие - НЕТ. "
@@ -117,12 +109,6 @@ class ClassificationResult(BaseModel):
     row_id: int = Field(
         description="Номер строки в батче, ровно как он указан слева в списке "
                     "(1, 2, 3...). Верни результат для КАЖДОЙ строки батча."
-    )
-    is_issue: bool = Field(
-        default=True,
-        description="False, если в строке нет проблемы (благодарность, приветствие, "
-                    "нейтральный факт, вопрос без жалобы). Тогда assigned_class "
-                    "и propose_new_class оставь пустыми."
     )
     assigned_class: Optional[str] = Field(
         default=None,
