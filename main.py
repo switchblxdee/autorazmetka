@@ -39,8 +39,19 @@ def main() -> None:
     if args.product_col not in df.columns:
         raise SystemExit(f"Колонки '{args.product_col}' нет в файле. Есть: {list(df.columns)}")
 
+    # после df.sample() индексы разрежены (2841, 17, 993...) — приводим к 0..N-1,
+    # иначе сопоставление результатов со строками становится хрупким
+    df = df.reset_index(drop=True)
+
     products = df[args.product_col].astype(str).tolist()
-    rows = list(zip(df.index.tolist(), products, df[args.text_col].astype(str).tolist()))
+    texts = df[args.text_col].astype(str).tolist()
+
+    # ВАЖНО: row_id — позиционный (0..N-1), а НЕ df.index.
+    # df.sample() / фильтрация оставляют разреженный индекс (2847, 91, ...),
+    # и модель, переписывая такие id обратно, регулярно их перевирает:
+    # класс либо теряется (пустая ячейка), либо встаёт не в ту строку.
+    # Короткие последовательные id этот класс ошибок почти убирают.
+    rows = list(zip(range(len(df)), products, texts))
 
     print(f"=== Фаза 1: exploratory ({len(rows)} строк) ===")
     candidates = run_exploratory(rows)
@@ -77,6 +88,19 @@ def main() -> None:
         )
 
     df["assigned_class"] = df.index.map(assignments)
+
+    # диагностика заполненности: пустая ячейка теперь означает реальную потерю
+    # строки (модель не вернула по ней результат), а не "не проблема"
+    blank = df["assigned_class"].isna().sum()
+    counts = df["assigned_class"].value_counts(dropna=False)
+    print(f"\nЗаполненность: {len(df) - blank} из {len(df)} строк получили класс")
+    if blank:
+        print(f"  [!] {blank} строк без класса — модель не вернула по ним результат.")
+        print(f"      Индексы: {df.index[df['assigned_class'].isna()].tolist()[:20]}")
+    for marker in ("NO_ISSUE", "NO_CLASS", "UNRESOLVED"):
+        if marker in counts:
+            print(f"  {marker}: {counts[marker]}")
+
     df.to_excel(args.output_xlsx, index=False)
 
     # Отдельно сохраняем таксономию - пригодится для следующего прогона

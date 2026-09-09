@@ -99,7 +99,45 @@ def _batches(rows: list[Row], size: int) -> Iterable[list[Row]]:
 
 
 def _rows_block(batch: list[Row]) -> str:
-    return "\n".join(f"{rid} [{product}]: {text}" for rid, product, text in batch)
+    """
+    Нумеруем строки ЛОКАЛЬНО внутри батча (1, 2, 3...), а не глобальным
+    индексом датафрейма. Модель на длинных разреженных id (какие даёт
+    df.sample()) путает цифры, теряет строки и выдумывает несуществующие
+    номера — назначения уезжают не в те строки. Короткий локальный номер
+    она копирует надёжно, а обратное сопоставление делаем сами.
+    """
+    return "\n".join(
+        f"{i} [{product}]: {text}"
+        for i, (_, product, text) in enumerate(batch, start=1)
+    )
+
+
+def _map_results(batch: list[Row], results: list, batch_desc: str) -> dict:
+    """
+    Сопоставляет локальные номера из ответа модели с реальными row_id батча
+    и громко ругается на расхождения вместо тихой потери строк.
+    Возвращает {реальный row_id: результат}.
+    """
+    mapped: dict = {}
+    seen_local: set[int] = set()
+
+    for r in results:
+        local = r.row_id
+        if not (1 <= local <= len(batch)):
+            print(f"  [{batch_desc}] модель вернула номер {local}, "
+                  f"которого нет в батче (1..{len(batch)}) — результат отброшен")
+            continue
+        if local in seen_local:
+            print(f"  [{batch_desc}] дубль номера {local} в ответе — взят первый")
+            continue
+        seen_local.add(local)
+        mapped[batch[local - 1][0]] = r
+
+    missing = [i for i in range(1, len(batch) + 1) if i not in seen_local]
+    if missing:
+        print(f"  [{batch_desc}] модель не вернула результат для строк "
+              f"{missing} — они останутся без класса")
+    return mapped
 
 
 def _group_rows_by_product(rows: list[Row]) -> dict[str, list[Row]]:
@@ -135,6 +173,7 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
             else:
                 existing = "(пока пусто — это первый батч по продукту)"
 
+            batch_desc = f"exploratory '{product}', строк {len(batch)}"
             result: ExploratoryBatchResult = _invoke_structured(
                 llm,
                 [
@@ -148,16 +187,16 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
                         product=product, rows_block=_rows_block(batch)
                     )),
                 ],
-                batch_desc=f"exploratory '{product}', rows {batch[0][0]}-{batch[-1][0]}",
+                batch_desc=batch_desc,
                 llm_raw=llm_raw,
             )
-            for p in result.proposals:
+            for real_row_id, p in _map_results(batch, result.proposals, batch_desc).items():
                 if not p.is_issue or p.label.strip().upper() == "NO_ISSUE":
                     # NO_ISSUE не должен попасть в таксономию и в кластеризацию -
                     # это не класс проблемы, а признак её отсутствия
                     continue
                 candidates.append(
-                    Candidate(p.label, p.description, [p.row_id], product)
+                    Candidate(p.label, p.description, [real_row_id], product)
                 )
                 if p.label not in known:
                     known[p.label] = p.description
@@ -340,6 +379,7 @@ def run_classification(
             taxonomy_block = "\n".join(
                 f"- {c.name}: {c.description}" for c in taxonomy.for_product(product)
             ) or "(классов для этого продукта пока нет)"
+            batch_desc = f"classification '{product}', строк {len(batch)}"
             result: ClassificationBatchResult = _invoke_structured(
                 llm,
                 [
@@ -350,14 +390,14 @@ def run_classification(
                         product=product, rows_block=_rows_block(batch)
                     )),
                 ],
-                batch_desc=f"classification '{product}', rows {batch[0][0]}-{batch[-1][0]}",
+                batch_desc=batch_desc,
                 llm_raw=llm_raw,
             )
-            for r in result.results:
+            for real_row_id, r in _map_results(batch, result.results, batch_desc).items():
                 if r.assigned_class:
-                    assignments[r.row_id] = r.assigned_class
+                    assignments[real_row_id] = r.assigned_class
                 elif r.propose_new_class:
-                    print(f"\n[row {r.row_id}] [{product}] Предложен НОВЫЙ класс: "
+                    print(f"\n[row {real_row_id}] [{product}] Предложен НОВЫЙ класс: "
                           f"{r.propose_new_class}")
                     print(f"  justification: {r.justification}")
                     confirm = input("Создать новый класс в таксономии? [y/n]: ").strip().lower()
@@ -366,14 +406,21 @@ def run_classification(
                             name=r.propose_new_class,
                             product=product,
                             description=r.propose_new_description or "",
-                            example_row_ids=[r.row_id],
+                            example_row_ids=[real_row_id],
                         )
                         taxonomy.classes.append(new_cls)
                         new_classes.append(new_cls)
-                        assignments[r.row_id] = new_cls.name
+                        assignments[real_row_id] = new_cls.name
                     else:
                         # fallback: помечаем как unresolved, назначишь руками
-                        assignments[r.row_id] = "UNRESOLVED"
+                        assignments[real_row_id] = "UNRESOLVED"
+                else:
+                    # модель не дала ни класса, ни предложения. Раньше такая
+                    # строка молча выпадала из assignments и приходила в xlsx
+                    # пустой ячейкой - теперь помечаем явно и различаем причину.
+                    assignments[real_row_id] = (
+                        "NO_ISSUE" if not r.is_issue else "NO_CLASS"
+                    )
 
     return assignments, new_classes
 
