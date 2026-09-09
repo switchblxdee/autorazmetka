@@ -54,8 +54,10 @@ def main() -> None:
     rows = list(zip(range(len(df)), products, texts))
 
     print(f"=== Фаза 1: exploratory ({len(rows)} строк) ===")
-    candidates = run_exploratory(rows)
+    candidates, service_rows = run_exploratory(rows)
     print(f"Собрано {len(candidates)} сырых кандидатов классов")
+    if service_rows:
+        print(f"Строк без проблемы (позитив/без предмета/нерелевантно): {len(service_rows)}")
 
     print("\n=== Фаза 2: consolidation (нужно твоё подтверждение по кластерам) ===")
     taxonomy = run_consolidation(candidates)
@@ -77,7 +79,12 @@ def main() -> None:
             print(f"    - {c.name}{alias_note}")
 
     print(f"\n=== Фаза 3: classification ===")
-    assignments, new_classes = run_classification(rows, taxonomy)
+    # строки без проблемы через классификацию не гоняем: их вид определён
+    # на фазе 1, платить за повторный вызов незачем
+    rows_to_classify = [r for r in rows if r[0] not in service_rows]
+    print(f"К классификации: {len(rows_to_classify)} из {len(rows)} строк")
+    assignments, new_classes = run_classification(rows_to_classify, taxonomy)
+    assignments.update(service_rows)
 
     if len(new_classes) > RECONSOLIDATE_THRESHOLD:
         print(
@@ -97,7 +104,8 @@ def main() -> None:
     if blank:
         print(f"  [!] {blank} строк без класса — модель не вернула по ним результат.")
         print(f"      Индексы: {df.index[df['assigned_class'].isna()].tolist()[:20]}")
-    for marker in ("NO_ISSUE", "NO_CLASS", "UNRESOLVED"):
+    for marker in ("POSITIVE", "NO_SUBJECT", "IRRELEVANT",
+                   "NO_ISSUE", "NO_CLASS", "UNRESOLVED"):
         if marker in counts:
             print(f"  {marker}: {counts[marker]}")
 

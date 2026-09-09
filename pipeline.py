@@ -149,9 +149,12 @@ def _group_rows_by_product(rows: list[Row]) -> dict[str, list[Row]]:
 
 # ---------- Фаза 1 ----------
 
-def run_exploratory(rows: list[Row]) -> list[Candidate]:
-    """rows: список (row_id, продукт, текст). Возвращает сырых кандидатов классов,
-    ДО консолидации — там ещё будут дубли, это ожидаемо.
+def run_exploratory(rows: list[Row]) -> tuple[list[Candidate], dict[int, str]]:
+    """rows: список (row_id, продукт, текст).
+
+    Возвращает (кандидаты классов, служебные строки). Кандидаты — ДО
+    консолидации, там ещё будут дубли, это ожидаемо. Служебные строки —
+    те, где проблемы нет: {row_id: POSITIVE | NO_SUBJECT | IRRELEVANT}.
 
     Идём ПО ПРОДУКТАМ и показываем модели классы только текущего продукта,
     с описаниями. Плоский список всех классов всех продуктов (как было раньше)
@@ -161,6 +164,11 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
     llm = _get_llm().with_structured_output(ExploratoryBatchResult)
     llm_raw = _get_llm().with_structured_output(ExploratoryBatchResult, include_raw=True)
     candidates: list[Candidate] = []
+    # строки, которые не несут проблемы: row_id -> POSITIVE / NO_SUBJECT / IRRELEVANT.
+    # Их нельзя терять - методология требует держать их в данных (раздел 7),
+    # просто в таксономию тем они не входят.
+    service_rows: dict[int, str] = {}
+    kind_counts: dict[str, int] = {}
 
     for product, product_rows in _group_rows_by_product(rows).items():
         # name -> description, только для текущего продукта
@@ -191,9 +199,12 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
                 llm_raw=llm_raw,
             )
             for real_row_id, p in _map_results(batch, result.proposals, batch_desc).items():
-                if not p.is_issue or p.label.strip().upper() == "NO_ISSUE":
-                    # NO_ISSUE не должен попасть в таксономию и в кластеризацию -
-                    # это не класс проблемы, а признак её отсутствия
+                kind_counts[p.kind] = kind_counts.get(p.kind, 0) + 1
+                if p.kind != "issue":
+                    # positive / no_subject / irrelevant в таксономию не идут:
+                    # это не классы проблем. Разделение на три служебных вида —
+                    # из методологии (раздел 7), поэтому не схлопываем их в один.
+                    service_rows[real_row_id] = p.kind.upper()
                     continue
                 candidates.append(
                     Candidate(p.label, p.description, [real_row_id], product)
@@ -203,7 +214,10 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
 
         print(f"  → уникальных классов у '{product}': {len(known)}")
 
-    return candidates
+    if kind_counts:
+        print(f"\nРазбивка по видам строк: {kind_counts}")
+
+    return candidates, service_rows
 
 
 EMBED_BATCH_SIZE = 50  # GigaChat Embeddings отдаёт 500 на слишком больших батчах
