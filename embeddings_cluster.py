@@ -42,6 +42,15 @@ def cosine_sim_matrix(vectors: np.ndarray) -> np.ndarray:
     return norm @ norm.T
 
 
+def nearest_neighbors(
+    embeddings: np.ndarray, idx: int, threshold: float
+) -> list[tuple[int, float]]:
+    """Индексы соседей idx с similarity >= threshold, по убыванию близости."""
+    sim = cosine_sim_matrix(embeddings)[idx]
+    pairs = [(j, float(sim[j])) for j in range(len(sim)) if j != idx and sim[j] >= threshold]
+    return sorted(pairs, key=lambda p: -p[1])
+
+
 def cluster_candidates(
     candidates: list[Candidate],
     embeddings: np.ndarray,

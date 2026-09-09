@@ -11,7 +11,10 @@ consolidation ещё раз, а не продолжать классификац
 import argparse
 import pandas as pd
 
-from pipeline import run_exploratory, run_consolidation, run_classification
+from pipeline import (
+    run_exploratory, run_consolidation, run_classification, merge_rare_classes,
+    MIN_EXAMPLES_PER_CLASS,
+)
 from schemas import Taxonomy
 
 RECONSOLIDATE_THRESHOLD = 10  # если новых классов больше - предупреждаем
@@ -45,6 +48,13 @@ def main() -> None:
 
     print("\n=== Фаза 2: consolidation (нужно твоё подтверждение по кластерам) ===")
     taxonomy = run_consolidation(candidates)
+    print(f"\nПосле консолидации: {len(taxonomy.classes)} классов")
+
+    print("\n=== Фаза 2b: добивка редких классов ===")
+    print(f"(классы с < {MIN_EXAMPLES_PER_CLASS} примеров вливаются в ближайший)")
+    auto = input("Подтверждать каждое слияние руками? [y/n, n = авто]: ").strip().lower()
+    taxonomy = merge_rare_classes(taxonomy, auto_confirm=(auto != "y"))
+
     print(f"\nИтоговая таксономия: {len(taxonomy.classes)} классов")
     by_product: dict[str, list] = {}
     for c in taxonomy.classes:

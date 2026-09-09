@@ -22,7 +22,8 @@ from schemas import (
     ClassificationBatchResult,
 )
 from embeddings_cluster import (
-    Candidate, cluster_candidates, singleton_candidates, group_by_product
+    Candidate, cluster_candidates, singleton_candidates, group_by_product,
+    nearest_neighbors,
 )
 import prompts
 
@@ -98,43 +99,69 @@ def _batches(rows: list[Row], size: int) -> Iterable[list[Row]]:
 
 
 def _rows_block(batch: list[Row]) -> str:
-    # продукт передаётся как контекст, не как отдельное измерение таксономии —
-    # помогает модели не путать одинаково звучащие проблемы у разных продуктов,
-    # но НЕ создаёт per-product классы
     return "\n".join(f"{rid} [{product}]: {text}" for rid, product, text in batch)
+
+
+def _group_rows_by_product(rows: list[Row]) -> dict[str, list[Row]]:
+    by_product: dict[str, list[Row]] = {}
+    for row in rows:
+        by_product.setdefault(row[1], []).append(row)
+    return by_product
 
 
 # ---------- Фаза 1 ----------
 
 def run_exploratory(rows: list[Row]) -> list[Candidate]:
     """rows: список (row_id, продукт, текст). Возвращает сырых кандидатов классов,
-    ДО консолидации — там ещё будут дубли, это ожидаемо."""
+    ДО консолидации — там ещё будут дубли, это ожидаемо.
+
+    Идём ПО ПРОДУКТАМ и показываем модели классы только текущего продукта,
+    с описаниями. Плоский список всех классов всех продуктов (как было раньше)
+    к 300+ классам превращается в нечитаемую простыню: модель не находит,
+    что переиспользовать, и плодит новый класс почти на каждую строку.
+    """
     llm = _get_llm().with_structured_output(ExploratoryBatchResult)
     llm_raw = _get_llm().with_structured_output(ExploratoryBatchResult, include_raw=True)
-    known_names: list[str] = []
     candidates: list[Candidate] = []
 
-    for batch in _batches(rows, BATCH_SIZE):
-        existing = ", ".join(known_names) if known_names else "(пока пусто)"
-        result: ExploratoryBatchResult = _invoke_structured(
-            llm,
-            [
-                ("system", prompts.EXPLORATORY_SYSTEM.format(existing_classes=existing)),
-                ("user", prompts.EXPLORATORY_USER.format(rows_block=_rows_block(batch))),
-            ],
-            batch_desc=f"exploratory batch, rows {batch[0][0]}-{batch[-1][0]}",
-            llm_raw=llm_raw,
-        )
-        for p in result.proposals:
-            if not p.is_issue or p.label.strip().upper() == "NO_ISSUE":
-                # NO_ISSUE не должен попасть в таксономию и в кластеризацию -
-                # это не класс проблемы, а признак её отсутствия
-                continue
-            candidates.append(
-                Candidate(p.label, p.description, [p.row_id], p.product)
+    for product, product_rows in _group_rows_by_product(rows).items():
+        # name -> description, только для текущего продукта
+        known: dict[str, str] = {}
+        print(f"\n--- Exploratory '{product}': {len(product_rows)} строк ---")
+
+        for batch in _batches(product_rows, BATCH_SIZE):
+            if known:
+                existing = "\n".join(f"- {n}: {d}" for n, d in known.items())
+            else:
+                existing = "(пока пусто — это первый батч по продукту)"
+
+            result: ExploratoryBatchResult = _invoke_structured(
+                llm,
+                [
+                    ("system", prompts.EXPLORATORY_SYSTEM.format(
+                        product=product,
+                        existing_classes=existing,
+                        existing_count=len(known),
+                    )),
+                    ("user", prompts.EXPLORATORY_USER.format(
+                        product=product, rows_block=_rows_block(batch)
+                    )),
+                ],
+                batch_desc=f"exploratory '{product}', rows {batch[0][0]}-{batch[-1][0]}",
+                llm_raw=llm_raw,
             )
-            if p.label not in known_names:
-                known_names.append(p.label)
+            for p in result.proposals:
+                if not p.is_issue or p.label.strip().upper() == "NO_ISSUE":
+                    # NO_ISSUE не должен попасть в таксономию и в кластеризацию -
+                    # это не класс проблемы, а признак её отсутствия
+                    continue
+                candidates.append(
+                    Candidate(p.label, p.description, [p.row_id], product)
+                )
+                if p.label not in known:
+                    known[p.label] = p.description
+
+        print(f"  → уникальных классов у '{product}': {len(known)}")
 
     return candidates
 
@@ -348,3 +375,97 @@ def run_classification(
                         assignments[r.row_id] = "UNRESOLVED"
 
     return assignments, new_classes
+
+
+# ---------- Фаза 2b: добивка редких классов ----------
+
+MIN_EXAMPLES_PER_CLASS = 5   # класс с меньшим числом примеров считается редким
+RARE_MERGE_THRESHOLD = 0.70  # порог ниже основного: ищем даже неблизких соседей
+
+
+def merge_rare_classes(taxonomy: Taxonomy, auto_confirm: bool = False) -> Taxonomy:
+    """
+    Второй проход консолидации, нацеленный именно на длинный хвост.
+
+    Промпт — мягкое давление, модель всё равно наплодит редких классов.
+    Здесь механика: каждый класс с < MIN_EXAMPLES_PER_CLASS примеров
+    пытаемся влить в ближайший по эмбеддингу класс ТОГО ЖЕ продукта,
+    с пониженным порогом similarity. Решение о слиянии всё равно принимает
+    LLM (чтобы не склеить 401 с 500), а подтверждаешь ты.
+
+    auto_confirm=True — принимать решения LLM без вопросов. Полезно, когда
+    редких классов сотни и подтверждать каждый руками нереально.
+    """
+    embed = _get_embeddings()
+    llm = _get_llm().with_structured_output(MergeDecision)
+    llm_raw = _get_llm().with_structured_output(MergeDecision, include_raw=True)
+
+    by_product: dict[str, list[TaxonomyClass]] = {}
+    for c in taxonomy.classes:
+        by_product.setdefault(c.product, []).append(c)
+
+    result_classes: list[TaxonomyClass] = []
+
+    for product, classes in by_product.items():
+        rare = [c for c in classes if len(c.example_row_ids) < MIN_EXAMPLES_PER_CLASS]
+        if not rare or len(classes) < 2:
+            result_classes.extend(classes)
+            continue
+
+        print(f"\n=== Добивка '{product}': {len(rare)} редких из {len(classes)} классов ===")
+
+        texts = [f"{c.name}: {c.description}".strip().rstrip(":") for c in classes]
+        vectors = _embed_texts(embed, texts)
+
+        # merged_into[i] = j означает, что класс i влит в класс j
+        merged_into: dict[int, int] = {}
+        by_index = {id(c): i for i, c in enumerate(classes)}
+
+        for c in rare:
+            i = by_index[id(c)]
+            if i in merged_into:
+                continue
+            for j, score in nearest_neighbors(vectors, i, RARE_MERGE_THRESHOLD):
+                if j in merged_into:  # не вливаем в того, кто сам уже влит
+                    continue
+                target = classes[j]
+                cluster_block = (
+                    f"- {c.name}: {c.description} "
+                    f"[{len(c.example_row_ids)} примеров — РЕДКИЙ]\n"
+                    f"- {target.name}: {target.description} "
+                    f"[{len(target.example_row_ids)} примеров]"
+                )
+                decision: MergeDecision = _invoke_structured(
+                    llm,
+                    [
+                        ("system", prompts.RARE_MERGE_SYSTEM),
+                        ("user", prompts.CONSOLIDATION_USER.format(
+                            product=product, cluster_block=cluster_block
+                        )),
+                    ],
+                    batch_desc=f"rare merge '{c.name}' -> '{target.name}'",
+                    llm_raw=llm_raw,
+                )
+                if not decision.is_same_class:
+                    continue
+
+                print(f"\n  РЕДКИЙ: {c.name} ({len(c.example_row_ids)} прим.)")
+                print(f"  ВЛИТЬ В: {target.name} ({len(target.example_row_ids)} прим.), "
+                      f"близость {score:.2f}")
+                print(f"  reasoning: {decision.reasoning}")
+                if auto_confirm:
+                    ok = True
+                else:
+                    ok = input("  Слить? [y/n]: ").strip().lower() == "y"
+                if ok:
+                    target.example_row_ids.extend(c.example_row_ids)
+                    target.aliases.append(c.name)
+                    target.aliases.extend(c.aliases)
+                    merged_into[i] = j
+                break  # с этим редким классом закончили
+
+        kept = [c for i, c in enumerate(classes) if i not in merged_into]
+        print(f"  → было {len(classes)}, стало {len(kept)}")
+        result_classes.extend(kept)
+
+    return Taxonomy(classes=result_classes)
