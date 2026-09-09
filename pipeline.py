@@ -118,6 +118,17 @@ def _map_results(batch: list[Row], results: list, batch_desc: str) -> dict:
     и громко ругается на расхождения вместо тихой потери строк.
     Возвращает {реальный row_id: результат}.
     """
+    # Фолбэк по позиции: если результатов ровно столько же, сколько строк,
+    # порядок почти наверняка сохранён, и номера просто съехали (модель
+    # пронумеровала с нуля или продублировала исходный индекс). Особенно
+    # часто на батчах из одной строки, где копировать номер не с чего.
+    if len(results) == len(batch):
+        locals_ = [r.row_id for r in results]
+        if sorted(locals_) != list(range(1, len(batch) + 1)):
+            print(f"  [{batch_desc}] номера от модели {locals_} не совпали с "
+                  f"1..{len(batch)}, но количество сошлось — сопоставляю по порядку")
+            return {batch[i][0]: r for i, r in enumerate(results)}
+
     mapped: dict = {}
     seen_local: set[int] = set()
 
@@ -147,6 +158,52 @@ def _group_rows_by_product(rows: list[Row]) -> dict[str, list[Row]]:
     return by_product
 
 
+MAX_COMPLETION_ROUNDS = 3  # раундов добора недостающих строк перед поштучным добиванием
+
+
+def _complete_batch(llm, llm_raw, batch, make_messages, extract, batch_desc):
+    """
+    Гарантирует результат для КАЖДОЙ строки батча.
+
+    Модель регулярно возвращает меньше результатов, чем строк — молча теряя
+    часть. Раньше такие строки просто печатались и пропадали. Теперь:
+      1) прогоняем батч;
+      2) смотрим, по каким строкам результата нет;
+      3) переспрашиваем ТОЛЬКО по недостающим (несколько раундов);
+      4) остаток добиваем поштучно — на одной строке модель не путается.
+
+    Возвращает {row_id: результат}. Если строка не закрылась даже поштучно,
+    её в словаре не будет, и вызывающий код обязан это отметить явно.
+    """
+    collected: dict = {}
+    remaining = list(batch)
+
+    for round_no in range(1, MAX_COMPLETION_ROUNDS + 1):
+        desc = batch_desc if round_no == 1 else f"{batch_desc}, добор {round_no}"
+        result = _invoke_structured(llm, make_messages(remaining), desc, llm_raw=llm_raw)
+        collected.update(_map_results(remaining, extract(result), desc))
+        remaining = [r for r in remaining if r[0] not in collected]
+        if not remaining:
+            return collected
+        print(f"  [{batch_desc}] не закрыто {len(remaining)} строк, переспрашиваю")
+
+    # поштучное добивание: дороже, но снимает проблему пропусков окончательно
+    for row in list(remaining):
+        desc = f"{batch_desc}, поштучно row {row[0]}"
+        try:
+            result = _invoke_structured(llm, make_messages([row]), desc, llm_raw=llm_raw)
+            single = _map_results([row], extract(result), desc)
+        except RuntimeError as e:
+            print(f"  [{desc}] не удалось: {e}")
+            continue
+        collected.update(single)
+
+    still_missing = [r[0] for r in batch if r[0] not in collected]
+    if still_missing:
+        print(f"  [{batch_desc}] ОСТАЛИСЬ БЕЗ РЕЗУЛЬТАТА: {still_missing}")
+    return collected
+
+
 # ---------- Фаза 1 ----------
 
 def run_exploratory(rows: list[Row]) -> tuple[list[Candidate], dict[int, str]]:
@@ -169,6 +226,7 @@ def run_exploratory(rows: list[Row]) -> tuple[list[Candidate], dict[int, str]]:
     # просто в таксономию тем они не входят.
     service_rows: dict[int, str] = {}
     kind_counts: dict[str, int] = {}
+    unresolved_rows: set[int] = set()
 
     for product, product_rows in _group_rows_by_product(rows).items():
         # name -> description, только для текущего продукта
@@ -182,23 +240,25 @@ def run_exploratory(rows: list[Row]) -> tuple[list[Candidate], dict[int, str]]:
                 existing = "(пока пусто — это первый батч по продукту)"
 
             batch_desc = f"exploratory '{product}', строк {len(batch)}"
-            result: ExploratoryBatchResult = _invoke_structured(
-                llm,
-                [
+
+            def make_messages(sub_batch, _existing=existing, _known=known):
+                return [
                     ("system", prompts.EXPLORATORY_SYSTEM.format(
                         methodology=prompts.METHODOLOGY,
                         product=product,
-                        existing_classes=existing,
-                        existing_count=len(known),
+                        existing_classes=_existing,
+                        existing_count=len(_known),
                     )),
                     ("user", prompts.EXPLORATORY_USER.format(
-                        product=product, rows_block=_rows_block(batch)
+                        product=product, rows_block=_rows_block(sub_batch)
                     )),
-                ],
-                batch_desc=batch_desc,
-                llm_raw=llm_raw,
+                ]
+
+            mapped = _complete_batch(
+                llm, llm_raw, batch, make_messages,
+                lambda r: r.proposals, batch_desc,
             )
-            for real_row_id, p in _map_results(batch, result.proposals, batch_desc).items():
+            for real_row_id, p in mapped.items():
                 kind_counts[p.kind] = kind_counts.get(p.kind, 0) + 1
                 if p.kind != "issue":
                     # positive / no_subject / irrelevant в таксономию не идут:
@@ -212,10 +272,20 @@ def run_exploratory(rows: list[Row]) -> tuple[list[Candidate], dict[int, str]]:
                 if p.label not in known:
                     known[p.label] = p.description
 
+            # строки, не закрывшиеся даже поштучно — не теряем, помечаем
+            for rid, _, _ in batch:
+                if rid not in mapped:
+                    unresolved_rows.add(rid)
+
         print(f"  → уникальных классов у '{product}': {len(known)}")
 
     if kind_counts:
         print(f"\nРазбивка по видам строк: {kind_counts}")
+    covered = sum(kind_counts.values())
+    print(f"Покрытие фазы 1: {covered} из {len(rows)} строк")
+    if unresolved_rows:
+        print(f"  [!] не удалось разобрать {len(unresolved_rows)} строк: "
+              f"{sorted(unresolved_rows)[:20]}")
 
     return candidates, service_rows
 
@@ -394,20 +464,22 @@ def run_classification(
                 f"- {c.name}: {c.description}" for c in taxonomy.for_product(product)
             ) or "(классов для этого продукта пока нет)"
             batch_desc = f"classification '{product}', строк {len(batch)}"
-            result: ClassificationBatchResult = _invoke_structured(
-                llm,
-                [
+
+            def make_messages(sub_batch, _tb=taxonomy_block):
+                return [
                     ("system", prompts.CLASSIFICATION_SYSTEM.format(
-                        product=product, taxonomy_block=taxonomy_block
+                        product=product, taxonomy_block=_tb
                     )),
                     ("user", prompts.CLASSIFICATION_USER.format(
-                        product=product, rows_block=_rows_block(batch)
+                        product=product, rows_block=_rows_block(sub_batch)
                     )),
-                ],
-                batch_desc=batch_desc,
-                llm_raw=llm_raw,
+                ]
+
+            mapped = _complete_batch(
+                llm, llm_raw, batch, make_messages,
+                lambda r: r.results, batch_desc,
             )
-            for real_row_id, r in _map_results(batch, result.results, batch_desc).items():
+            for real_row_id, r in mapped.items():
                 if r.assigned_class:
                     assignments[real_row_id] = r.assigned_class
                 elif r.propose_new_class:
@@ -435,6 +507,11 @@ def run_classification(
                     assignments[real_row_id] = (
                         "NO_ISSUE" if not r.is_issue else "NO_CLASS"
                     )
+
+            # строки, не закрывшиеся даже поштучным добиванием
+            for rid, _, _ in batch:
+                if rid not in mapped:
+                    assignments[rid] = "FAILED"
 
     return assignments, new_classes
 

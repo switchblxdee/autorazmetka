@@ -105,7 +105,7 @@ def main() -> None:
         print(f"  [!] {blank} строк без класса — модель не вернула по ним результат.")
         print(f"      Индексы: {df.index[df['assigned_class'].isna()].tolist()[:20]}")
     for marker in ("POSITIVE", "NO_SUBJECT", "IRRELEVANT",
-                   "NO_ISSUE", "NO_CLASS", "UNRESOLVED"):
+                   "NO_ISSUE", "NO_CLASS", "UNRESOLVED", "FAILED"):
         if marker in counts:
             print(f"  {marker}: {counts[marker]}")
 
