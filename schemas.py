@@ -87,22 +87,49 @@ class Taxonomy(BaseModel):
         return [c for c in self.classes if c.product == product]
 
 
-class MergeDecision(BaseModel):
-    """Решение LLM по одному кластеру потенциально похожих кандидатов."""
-    is_same_class: bool = Field(
-        description="True, если все кандидаты в кластере — это по сути один и тот же класс "
-                    "по смыслу, а не по формулировке"
+class MergeGroup(BaseModel):
+    """Одна группа внутри кластера — набор кандидатов, которые суть один класс."""
+    canonical_name: str = Field(
+        description="Итоговое имя группы в формате 'Продукт: Проблема'. "
+                    "Бери самую понятную и общую из формулировок группы."
     )
-    canonical_name: Optional[str] = Field(
-        default=None, description="Итоговое каноничное имя, если is_same_class=True"
+    canonical_description: str = Field(
+        description="Определение класса: какие кейсы сюда попадают, а какие нет"
     )
-    canonical_description: Optional[str] = Field(
-        default=None, description="Итоговое описание класса, если is_same_class=True"
+    member_names: list[str] = Field(
+        description="Имена кандидатов из кластера, входящих в эту группу, ДОСЛОВНО "
+                    "как они переданы. Каждый кандидат должен попасть ровно в одну "
+                    "группу. Кандидат, который ни с кем не сливается, образует "
+                    "группу из одного себя."
     )
-    reasoning: str = Field(description="Короткое обоснование решения")
+
+
+class ClusterPartition(BaseModel):
+    """
+    Разбиение кластера похожих кандидатов на группы.
+
+    Кластер собран по эмбеддингам и почти всегда неоднороден: рядом лежат
+    и настоящие дубли, и близкие, но разные проблемы. Поэтому решение не
+    'слить весь кластер или нет', а 'разложить на группы': иначе один
+    чужеродный кандидат мешает слить остальные.
+    """
+    groups: list[MergeGroup] = Field(
+        description="Группы, на которые разбит кластер. Дубли-переформулировки "
+                    "одной проблемы — в одну группу. Разные по сути проблемы — "
+                    "в разные."
+    )
+    reasoning: str = Field(description="Короткое обоснование разбиения")
 
 
 # ---------- Фаза 3: classification (финальная разметка) ----------
+
+class RareMergeDecision(BaseModel):
+    """Решение: влить редкий класс в основной или оставить отдельным."""
+    is_same_class: bool = Field(
+        description="True, если обе проблемы чинятся одним и тем же фиксом"
+    )
+    reasoning: str = Field(description="Короткое обоснование решения")
+
 
 class ClassificationResult(BaseModel):
     """Результат классификации одной строки."""

@@ -18,7 +18,8 @@ from schemas import (
     ExploratoryBatchResult,
     Taxonomy,
     TaxonomyClass,
-    MergeDecision,
+    ClusterPartition,
+    RareMergeDecision,
     ClassificationBatchResult,
 )
 from embeddings_cluster import (
@@ -118,6 +119,27 @@ def _map_results(batch: list[Row], results: list, batch_desc: str) -> dict:
     и громко ругается на расхождения вместо тихой потери строк.
     Возвращает {реальный row_id: результат}.
     """
+    # Модель вернула БОЛЬШЕ результатов, чем строк. Обычно это мультилейбл:
+    # на отзыв с несколькими фактами она заводит несколько записей, а номера
+    # для лишних берёт с потолка (повторяет или продолжает за длину батча).
+    # Отбрасывать их нельзя - среди них есть валидные первые метки.
+    if len(results) > len(batch):
+        print(f"  [{batch_desc}] результатов {len(results)} на {len(batch)} строк — "
+              f"похоже на мультилейбл, беру по первому на строку")
+        mapped: dict = {}
+        overflow: list = []
+        for r in results:
+            local = r.row_id
+            if 1 <= local <= len(batch) and batch[local - 1][0] not in mapped:
+                mapped[batch[local - 1][0]] = r
+            else:
+                overflow.append(r)
+        # незакрытые строки добираем лишними результатами по порядку
+        for rid, _, _ in batch:
+            if rid not in mapped and overflow:
+                mapped[rid] = overflow.pop(0)
+        return mapped
+
     # Фолбэк по позиции: если результатов ровно столько же, сколько строк,
     # порядок почти наверняка сохранён, и номера просто съехали (модель
     # пронумеровала с нуля или продублировала исходный индекс). Особенно
@@ -131,12 +153,13 @@ def _map_results(batch: list[Row], results: list, batch_desc: str) -> dict:
 
     mapped: dict = {}
     seen_local: set[int] = set()
+    all_ids = [r.row_id for r in results]
 
     for r in results:
         local = r.row_id
         if not (1 <= local <= len(batch)):
-            print(f"  [{batch_desc}] модель вернула номер {local}, "
-                  f"которого нет в батче (1..{len(batch)}) — результат отброшен")
+            print(f"  [{batch_desc}] номер {local} вне батча (1..{len(batch)}) — "
+                  f"отброшен. Все номера от модели: {all_ids}")
             continue
         if local in seen_local:
             print(f"  [{batch_desc}] дубль номера {local} в ответе — взят первый")
@@ -328,8 +351,8 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
     print(f"После схлопывания точных дублей осталось {len(candidates)} уникальных кандидатов")
 
     embed = _get_embeddings()
-    llm = _get_llm().with_structured_output(MergeDecision)
-    llm_raw = _get_llm().with_structured_output(MergeDecision, include_raw=True)
+    llm = _get_llm().with_structured_output(ClusterPartition)
+    llm_raw = _get_llm().with_structured_output(ClusterPartition, include_raw=True)
     taxonomy = Taxonomy()
 
     groups = group_by_product(candidates)
@@ -348,11 +371,10 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
             )
             continue
 
-        # пустое описание -> вырожденная строка "name: ", GigaChat такое не любит
-        texts = [
-            f"{c.name}: {c.description}".strip().rstrip(":").strip() or c.name
-            for c in product_candidates
-        ]
+        # Эмбедим ТОЛЬКО имя класса. Раньше сюда шло "имя: описание", и длинное
+        # описание перевешивало короткое имя: две одинаковые по смыслу метки
+        # с по-разному написанными описаниями расходились по разным кластерам.
+        texts = [c.name.strip() or "без имени" for c in product_candidates]
         vectors = _embed_texts(embed, texts)
 
         clusters = cluster_candidates(product_candidates, vectors)
@@ -360,7 +382,7 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
 
         for cluster in clusters:
             cluster_block = "\n".join(f"- {c.name}: {c.description}" for c in cluster)
-            decision: MergeDecision = _invoke_structured(
+            partition: ClusterPartition = _invoke_structured(
                 llm,
                 [
                     ("system", prompts.CONSOLIDATION_SYSTEM),
@@ -372,17 +394,34 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
                 llm_raw=llm_raw,
             )
 
-            print(f"\n--- Кластер кандидатов [{product}] ---")
+            by_name = {c.name: c for c in cluster}
+            print(f"\n--- Кластер [{product}], {len(cluster)} кандидатов ---")
             print(cluster_block)
-            print(f"\nМодель предлагает: is_same_class={decision.is_same_class}")
-            if decision.is_same_class:
-                print(f"  -> canonical_name: {decision.canonical_name}")
-                print(f"  -> description: {decision.canonical_description}")
-            print(f"  -> reasoning: {decision.reasoning}")
-            confirm = input("Применить это решение? [y/n/e(edit name)]: ").strip().lower()
+            print(f"\nМодель разбила на {len(partition.groups)} групп "
+                  f"({partition.reasoning}):")
 
+            claimed: set[str] = set()
+            planned: list[tuple[str, str, list[Candidate]]] = []
+            for g in partition.groups:
+                members = [by_name[n] for n in g.member_names if n in by_name
+                           and n not in claimed]
+                claimed.update(m.name for m in members)
+                if not members:
+                    continue
+                planned.append((g.canonical_name, g.canonical_description, members))
+                merged_note = (f"  ← {', '.join(m.name for m in members if m.name != g.canonical_name)}"
+                               if len(members) > 1 else "  (без слияния)")
+                print(f"  • {g.canonical_name}{merged_note}")
+
+            # кандидаты, которых модель забыла разложить — не теряем
+            forgotten = [c for c in cluster if c.name not in claimed]
+            if forgotten:
+                print(f"  [!] модель не разложила {len(forgotten)}: "
+                      f"{[c.name for c in forgotten]} — оставляю как есть")
+                planned.extend((c.name, c.description, [c]) for c in forgotten)
+
+            confirm = input("Применить разбиение? [y/n(оставить всё как было)]: ").strip().lower()
             if confirm == "n":
-                # оставляем кандидатов как отдельные классы без мерджа
                 for c in cluster:
                     taxonomy.classes.append(
                         TaxonomyClass(
@@ -392,19 +431,16 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
                     )
                 continue
 
-            name = decision.canonical_name or cluster[0].name
-            desc = decision.canonical_description or cluster[0].description
-            if confirm == "e":
-                name = input(f"Новое имя (было '{name}'): ").strip() or name
-
-            aliases = [c.name for c in cluster if c.name != name]
-            all_row_ids = [rid for c in cluster for rid in c.source_row_ids]
-            taxonomy.classes.append(
-                TaxonomyClass(
-                    name=name, product=product, description=desc,
-                    example_row_ids=all_row_ids, aliases=aliases,
+            for name, desc, members in planned:
+                taxonomy.classes.append(
+                    TaxonomyClass(
+                        name=name,
+                        product=product,
+                        description=desc or members[0].description,
+                        example_row_ids=[rid for m in members for rid in m.source_row_ids],
+                        aliases=[m.name for m in members if m.name != name],
+                    )
                 )
-            )
 
         for c in singles:
             taxonomy.classes.append(
@@ -517,8 +553,8 @@ def merge_rare_classes(taxonomy: Taxonomy, auto_confirm: bool = False) -> Taxono
     редких классов сотни и подтверждать каждый руками нереально.
     """
     embed = _get_embeddings()
-    llm = _get_llm().with_structured_output(MergeDecision)
-    llm_raw = _get_llm().with_structured_output(MergeDecision, include_raw=True)
+    llm = _get_llm().with_structured_output(RareMergeDecision)
+    llm_raw = _get_llm().with_structured_output(RareMergeDecision, include_raw=True)
 
     by_product: dict[str, list[TaxonomyClass]] = {}
     for c in taxonomy.classes:
@@ -555,7 +591,7 @@ def merge_rare_classes(taxonomy: Taxonomy, auto_confirm: bool = False) -> Taxono
                     f"- {target.name}: {target.description} "
                     f"[{len(target.example_row_ids)} примеров]"
                 )
-                decision: MergeDecision = _invoke_structured(
+                decision: RareMergeDecision = _invoke_structured(
                     llm,
                     [
                         ("system", prompts.RARE_MERGE_SYSTEM),
