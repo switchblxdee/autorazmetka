@@ -8,7 +8,17 @@
 """
 from __future__ import annotations
 import os
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable
+
+from tqdm.auto import tqdm
+
+
+def _log(*args) -> None:
+    """print, не ломающий прогресс-бары tqdm (в т.ч. из рабочих потоков)."""
+    tqdm.write(" ".join(str(a) for a in args))
 
 import numpy as np
 from langchain_gigachat.chat_models import GigaChat
@@ -30,6 +40,20 @@ import prompts
 
 BATCH_SIZE = 25  # для 1k-10k строк ~40-400 вызовов на фазу, разумно
 MAX_RETRIES = 3  # ретраи на батч, если модель не вызвала tool вместо structured output
+MAX_WORKERS = 2  # столько потоков разрешает тариф GigaChat; выше — посыплются 429
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "429" in text or "rate limit" in text or "too many requests" in text
+
+
+def _sleep_backoff(attempt: int, batch_desc: str) -> None:
+    """Экспоненциальный бэкофф с джиттером. Без него параллельные воркеры
+    на рейт-лимите синхронно долбятся и делают только хуже."""
+    delay = min(2 ** attempt, 30) + random.uniform(0, 1.5)
+    _log(f"  [{batch_desc}] rate limit, жду {delay:.1f}с")
+    time.sleep(delay)
 
 
 def _get_llm(temperature: float = 0.0) -> GigaChat:
@@ -62,25 +86,35 @@ def _invoke_structured(llm, messages: list[tuple[str, str]], batch_desc: str, ll
     и понять, ЧТО именно она написала вместо вызова tool.
     """
     last_exc = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    attempt = 0
+    rate_limit_hits = 0
+    while attempt < MAX_RETRIES:
+        attempt += 1
         is_last = attempt == MAX_RETRIES
         try:
             if is_last and llm_raw is not None:
                 raw_result = llm_raw.invoke(messages)
                 result = raw_result.get("parsed")
                 if result is None:
-                    print(f"  [{batch_desc}] сырой ответ модели на провалившейся попытке:")
-                    print(f"    {raw_result.get('raw')}")
-                    print(f"    parsing_error: {raw_result.get('parsing_error')}")
+                    _log(f"  [{batch_desc}] сырой ответ модели на провалившейся попытке:")
+                    _log(f"    {raw_result.get('raw')}")
+                    _log(f"    parsing_error: {raw_result.get('parsing_error')}")
             else:
                 result = llm.invoke(messages)
-        except Exception as e:  # сетевые сбои GigaChat тоже сюда
+        except Exception as e:
+            if _is_rate_limit(e) and rate_limit_hits < 6:
+                # 429 — это не провал попытки, а просьба подождать:
+                # ретрай не тратим, просто спим и повторяем
+                rate_limit_hits += 1
+                attempt -= 1
+                _sleep_backoff(rate_limit_hits, batch_desc)
+                continue
             last_exc = e
-            print(f"  [{batch_desc}] попытка {attempt}/{MAX_RETRIES}: ошибка вызова ({e})")
+            _log(f"  [{batch_desc}] попытка {attempt}/{MAX_RETRIES}: ошибка вызова ({e})")
             continue
         if result is not None:
             return result
-        print(
+        _log(
             f"  [{batch_desc}] попытка {attempt}/{MAX_RETRIES}: "
             f"модель не вызвала tool, structured output = None, ретраю"
         )
@@ -124,7 +158,7 @@ def _map_results(batch: list[Row], results: list, batch_desc: str) -> dict:
     # для лишних берёт с потолка (повторяет или продолжает за длину батча).
     # Отбрасывать их нельзя - среди них есть валидные первые метки.
     if len(results) > len(batch):
-        print(f"  [{batch_desc}] результатов {len(results)} на {len(batch)} строк — "
+        _log(f"  [{batch_desc}] результатов {len(results)} на {len(batch)} строк — "
               f"похоже на мультилейбл, беру по первому на строку")
         mapped: dict = {}
         overflow: list = []
@@ -147,7 +181,7 @@ def _map_results(batch: list[Row], results: list, batch_desc: str) -> dict:
     if len(results) == len(batch):
         locals_ = [r.row_id for r in results]
         if sorted(locals_) != list(range(1, len(batch) + 1)):
-            print(f"  [{batch_desc}] номера от модели {locals_} не совпали с "
+            _log(f"  [{batch_desc}] номера от модели {locals_} не совпали с "
                   f"1..{len(batch)}, но количество сошлось — сопоставляю по порядку")
             return {batch[i][0]: r for i, r in enumerate(results)}
 
@@ -158,18 +192,18 @@ def _map_results(batch: list[Row], results: list, batch_desc: str) -> dict:
     for r in results:
         local = r.row_id
         if not (1 <= local <= len(batch)):
-            print(f"  [{batch_desc}] номер {local} вне батча (1..{len(batch)}) — "
+            _log(f"  [{batch_desc}] номер {local} вне батча (1..{len(batch)}) — "
                   f"отброшен. Все номера от модели: {all_ids}")
             continue
         if local in seen_local:
-            print(f"  [{batch_desc}] дубль номера {local} в ответе — взят первый")
+            _log(f"  [{batch_desc}] дубль номера {local} в ответе — взят первый")
             continue
         seen_local.add(local)
         mapped[batch[local - 1][0]] = r
 
     missing = [i for i in range(1, len(batch) + 1) if i not in seen_local]
     if missing:
-        print(f"  [{batch_desc}] модель не вернула результат для строк "
+        _log(f"  [{batch_desc}] модель не вернула результат для строк "
               f"{missing} — они останутся без класса")
     return mapped
 
@@ -208,7 +242,7 @@ def _complete_batch(llm, llm_raw, batch, make_messages, extract, batch_desc):
         remaining = [r for r in remaining if r[0] not in collected]
         if not remaining:
             return collected
-        print(f"  [{batch_desc}] не закрыто {len(remaining)} строк, переспрашиваю")
+        _log(f"  [{batch_desc}] не закрыто {len(remaining)} строк, переспрашиваю")
 
     # поштучное добивание: дороже, но снимает проблему пропусков окончательно
     for row in list(remaining):
@@ -217,13 +251,13 @@ def _complete_batch(llm, llm_raw, batch, make_messages, extract, batch_desc):
             result = _invoke_structured(llm, make_messages([row]), desc, llm_raw=llm_raw)
             single = _map_results([row], extract(result), desc)
         except RuntimeError as e:
-            print(f"  [{desc}] не удалось: {e}")
+            _log(f"  [{desc}] не удалось: {e}")
             continue
         collected.update(single)
 
     still_missing = [r[0] for r in batch if r[0] not in collected]
     if still_missing:
-        print(f"  [{batch_desc}] ОСТАЛИСЬ БЕЗ РЕЗУЛЬТАТА: {still_missing}")
+        _log(f"  [{batch_desc}] ОСТАЛИСЬ БЕЗ РЕЗУЛЬТАТА: {still_missing}")
     return collected
 
 
@@ -244,11 +278,20 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
     llm_raw = _get_llm().with_structured_output(ExploratoryBatchResult, include_raw=True)
     candidates: list[Candidate] = []
     unresolved_rows: set[int] = set()
+    bar: tqdm | None = None  # создаётся ниже, обновляется внутри process_product
 
-    for product, product_rows in _group_rows_by_product(rows).items():
-        # name -> description, только для текущего продукта
+    def process_product(item):
+        """
+        Один продукт целиком. Внутри продукта батчи ИДУТ ПОСЛЕДОВАТЕЛЬНО —
+        каждый следующий должен видеть классы, накопленные предыдущим,
+        иначе модель не сможет их переиспользовать и наплодит дублей.
+        А вот разные продукты друг от друга не зависят и идут параллельно.
+        """
+        product, product_rows = item
         known: dict[str, str] = {}
-        print(f"\n--- Exploratory '{product}': {len(product_rows)} строк ---")
+        local_candidates: list[Candidate] = []
+        local_unresolved: set[int] = set()
+        _log(f"--- Exploratory '{product}': {len(product_rows)} строк ---")
 
         for batch in _batches(product_rows, BATCH_SIZE):
             if known:
@@ -276,7 +319,7 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
                 lambda r: r.proposals, batch_desc,
             )
             for real_row_id, p in mapped.items():
-                candidates.append(
+                local_candidates.append(
                     Candidate(p.label, p.description, [real_row_id], product)
                 )
                 if p.label not in known:
@@ -285,14 +328,32 @@ def run_exploratory(rows: list[Row]) -> list[Candidate]:
             # строки, не закрывшиеся даже поштучно — не теряем, помечаем
             for rid, _, _ in batch:
                 if rid not in mapped:
-                    unresolved_rows.add(rid)
+                    local_unresolved.add(rid)
 
-        print(f"  → уникальных классов у '{product}': {len(known)}")
+            bar.update(1)
+
+        _log(f"  → уникальных классов у '{product}': {len(known)}")
+        return local_candidates, local_unresolved
+
+    products = list(_group_rows_by_product(rows).items())
+    total_batches = sum(
+        -(-len(prod_rows) // BATCH_SIZE) for _, prod_rows in products
+    )
+    _log(f"Продуктов: {len(products)}, батчей: {total_batches}, потоков: {MAX_WORKERS}")
+
+    bar = tqdm(total=total_batches, desc="Фаза 1: разметка", unit="батч")
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            for local_candidates, local_unresolved in pool.map(process_product, products):
+                candidates.extend(local_candidates)
+                unresolved_rows.update(local_unresolved)
+    finally:
+        bar.close()
 
     covered = len({rid for c in candidates for rid in c.source_row_ids})
-    print(f"\nПокрытие фазы 1: {covered} из {len(rows)} строк")
+    _log(f"\nПокрытие фазы 1: {covered} из {len(rows)} строк")
     if unresolved_rows:
-        print(f"  [!] не удалось разобрать {len(unresolved_rows)} строк: "
+        _log(f"  [!] не удалось разобрать {len(unresolved_rows)} строк: "
               f"{sorted(unresolved_rows)[:20]}")
 
     return candidates
@@ -308,10 +369,8 @@ def _embed_texts(embed: GigaChatEmbeddings, texts: list[str]) -> np.ndarray:
     exploratory даёт сопоставимое число кандидатов, одним запросом не влезает.
     """
     vectors: list[list[float]] = []
-    total = (len(texts) + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE
-    for i in range(0, len(texts), EMBED_BATCH_SIZE):
-        chunk = texts[i : i + EMBED_BATCH_SIZE]
-        print(f"  эмбеддинги: батч {i // EMBED_BATCH_SIZE + 1}/{total} ({len(chunk)} шт.)")
+    chunks = [texts[i:i + EMBED_BATCH_SIZE] for i in range(0, len(texts), EMBED_BATCH_SIZE)]
+    for chunk in tqdm(chunks, desc="эмбеддинги", unit="батч", leave=False):
         vectors.extend(embed.embed_documents(chunk))
     return np.array(vectors)
 
@@ -348,7 +407,7 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
     3. только после твоего "да" оно применяется.
     """
     candidates = _dedup_candidates(candidates)
-    print(f"После схлопывания точных дублей осталось {len(candidates)} уникальных кандидатов")
+    _log(f"После схлопывания точных дублей осталось {len(candidates)} уникальных кандидатов")
 
     embed = _get_embeddings()
     llm = _get_llm().with_structured_output(ClusterPartition)
@@ -356,10 +415,10 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
     taxonomy = Taxonomy()
 
     groups = group_by_product(candidates)
-    print(f"Продуктов в данных: {len(groups)}")
+    _log(f"Продуктов в данных: {len(groups)}")
 
     for product, product_candidates in groups.items():
-        print(f"\n=== Продукт '{product}': {len(product_candidates)} кандидатов ===")
+        _log(f"\n=== Продукт '{product}': {len(product_candidates)} кандидатов ===")
 
         if len(product_candidates) == 1:
             c = product_candidates[0]
@@ -380,9 +439,11 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
         clusters = cluster_candidates(product_candidates, vectors)
         singles = singleton_candidates(product_candidates, vectors)
 
-        for cluster in clusters:
+        # Решения LLM считаем СРАЗУ по всем кластерам, параллельно, и только
+        # потом задаём вопросы: иначе ты ждёшь вызов перед каждым вопросом.
+        def decide(cluster):
             cluster_block = "\n".join(f"- {c.name}: {c.description}" for c in cluster)
-            partition: ClusterPartition = _invoke_structured(
+            return cluster, cluster_block, _invoke_structured(
                 llm,
                 [
                     ("system", prompts.CONSOLIDATION_SYSTEM),
@@ -394,10 +455,21 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
                 llm_raw=llm_raw,
             )
 
+        if clusters:
+            _log(f"Считаю разбиение {len(clusters)} кластеров в {MAX_WORKERS} потока...")
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                decided = list(tqdm(
+                    pool.map(decide, clusters), total=len(clusters),
+                    desc=f"Фаза 2: '{product}'", unit="кластер", leave=False,
+                ))
+        else:
+            decided = []
+
+        for cluster, cluster_block, partition in decided:
             by_name = {c.name: c for c in cluster}
-            print(f"\n--- Кластер [{product}], {len(cluster)} кандидатов ---")
-            print(cluster_block)
-            print(f"\nМодель разбила на {len(partition.groups)} групп "
+            _log(f"\n--- Кластер [{product}], {len(cluster)} кандидатов ---")
+            _log(cluster_block)
+            _log(f"\nМодель разбила на {len(partition.groups)} групп "
                   f"({partition.reasoning}):")
 
             claimed: set[str] = set()
@@ -411,12 +483,12 @@ def run_consolidation(candidates: list[Candidate]) -> Taxonomy:
                 planned.append((g.canonical_name, g.canonical_description, members))
                 merged_note = (f"  ← {', '.join(m.name for m in members if m.name != g.canonical_name)}"
                                if len(members) > 1 else "  (без слияния)")
-                print(f"  • {g.canonical_name}{merged_note}")
+                _log(f"  • {g.canonical_name}{merged_note}")
 
             # кандидаты, которых модель забыла разложить — не теряем
             forgotten = [c for c in cluster if c.name not in claimed]
             if forgotten:
-                print(f"  [!] модель не разложила {len(forgotten)}: "
+                _log(f"  [!] модель не разложила {len(forgotten)}: "
                       f"{[c.name for c in forgotten]} — оставляю как есть")
                 planned.extend((c.name, c.description, [c]) for c in forgotten)
 
@@ -474,61 +546,77 @@ def run_classification(
     for row in rows:
         by_product.setdefault(row[1], []).append(row)
 
+    # Собираем все задания заранее. Таксономия на этой фазе уже зафиксирована
+    # консолидацией, поэтому блок классов можно посчитать один раз на продукт,
+    # а не пересобирать на каждом батче — это и позволяет всё распараллелить.
+    jobs: list[tuple[str, list[Row], str]] = []
     for product, product_rows in by_product.items():
-        product_classes = taxonomy.for_product(product)
-        print(f"\n--- Классификация '{product}': {len(product_rows)} строк, "
-              f"{len(product_classes)} классов ---")
-
+        taxonomy_block = "\n".join(
+            f"- {c.name}: {c.description}" for c in taxonomy.for_product(product)
+        ) or "(классов для этого продукта пока нет)"
+        _log(f"--- '{product}': {len(product_rows)} строк, "
+              f"{len(taxonomy.for_product(product))} классов ---")
         for batch in _batches(product_rows, BATCH_SIZE):
-            # пересобираем блок на каждом батче: новые классы могли добавиться
-            taxonomy_block = "\n".join(
-                f"- {c.name}: {c.description}" for c in taxonomy.for_product(product)
-            ) or "(классов для этого продукта пока нет)"
-            batch_desc = f"classification '{product}', строк {len(batch)}"
+            jobs.append((product, batch, taxonomy_block))
 
-            def make_messages(sub_batch, _tb=taxonomy_block):
-                return [
-                    ("system", prompts.CLASSIFICATION_SYSTEM.format(
-                        product=product, taxonomy_block=_tb
-                    )),
-                    ("user", prompts.CLASSIFICATION_USER.format(
-                        product=product, rows_block=_rows_block(sub_batch)
-                    )),
-                ]
+    def run_job(job):
+        product, batch, taxonomy_block = job
+        batch_desc = f"classification '{product}', строк {len(batch)}"
 
-            mapped = _complete_batch(
-                llm, llm_raw, batch, make_messages,
-                lambda r: r.results, batch_desc,
-            )
-            for real_row_id, r in mapped.items():
-                if r.assigned_class:
-                    assignments[real_row_id] = r.assigned_class
-                elif r.propose_new_class:
-                    print(f"\n[row {real_row_id}] [{product}] Предложен НОВЫЙ класс: "
-                          f"{r.propose_new_class}")
-                    print(f"  justification: {r.justification}")
-                    confirm = input("Создать новый класс в таксономии? [y/n]: ").strip().lower()
-                    if confirm == "y":
-                        new_cls = TaxonomyClass(
-                            name=r.propose_new_class,
-                            product=product,
-                            description=r.propose_new_description or "",
-                            example_row_ids=[real_row_id],
-                        )
-                        taxonomy.classes.append(new_cls)
-                        new_classes.append(new_cls)
-                        assignments[real_row_id] = new_cls.name
-                    else:
-                        # fallback: помечаем как unresolved, назначишь руками
-                        assignments[real_row_id] = "UNRESOLVED"
+        def make_messages(sub_batch):
+            return [
+                ("system", prompts.CLASSIFICATION_SYSTEM.format(
+                    product=product, taxonomy_block=taxonomy_block
+                )),
+                ("user", prompts.CLASSIFICATION_USER.format(
+                    product=product, rows_block=_rows_block(sub_batch)
+                )),
+            ]
+
+        mapped = _complete_batch(
+            llm, llm_raw, batch, make_messages, lambda r: r.results, batch_desc,
+        )
+        return product, batch, mapped
+
+    _log(f"\nПрогоняю {len(jobs)} батчей в {MAX_WORKERS} потока...")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        done = list(tqdm(
+            pool.map(run_job, jobs), total=len(jobs),
+            desc="Фаза 3: классификация", unit="батч",
+        ))
+
+    # Вопросы к тебе — только после всех вызовов, последовательно:
+    # input() из рабочих потоков работать не может.
+    for product, batch, mapped in done:
+        for real_row_id, r in mapped.items():
+            if r.assigned_class:
+                assignments[real_row_id] = r.assigned_class
+            elif r.propose_new_class:
+                _log(f"\n[row {real_row_id}] [{product}] Предложен НОВЫЙ класс: "
+                      f"{r.propose_new_class}")
+                _log(f"  justification: {r.justification}")
+                confirm = input("Создать новый класс в таксономии? [y/n]: ").strip().lower()
+                if confirm == "y":
+                    new_cls = TaxonomyClass(
+                        name=r.propose_new_class,
+                        product=product,
+                        description=r.propose_new_description or "",
+                        example_row_ids=[real_row_id],
+                    )
+                    taxonomy.classes.append(new_cls)
+                    new_classes.append(new_cls)
+                    assignments[real_row_id] = new_cls.name
                 else:
-                    # модель не дала ни класса, ни предложения
-                    assignments[real_row_id] = "NO_CLASS"
+                    # fallback: помечаем как unresolved, назначишь руками
+                    assignments[real_row_id] = "UNRESOLVED"
+            else:
+                # модель не дала ни класса, ни предложения
+                assignments[real_row_id] = "NO_CLASS"
 
-            # строки, не закрывшиеся даже поштучным добиванием
-            for rid, _, _ in batch:
-                if rid not in mapped:
-                    assignments[rid] = "FAILED"
+        # строки, не закрывшиеся даже поштучным добиванием
+        for rid, _, _ in batch:
+            if rid not in mapped:
+                assignments[rid] = "FAILED"
 
     return assignments, new_classes
 
@@ -568,7 +656,7 @@ def merge_rare_classes(taxonomy: Taxonomy, auto_confirm: bool = False) -> Taxono
             result_classes.extend(classes)
             continue
 
-        print(f"\n=== Добивка '{product}': {len(rare)} редких из {len(classes)} классов ===")
+        _log(f"\n=== Добивка '{product}': {len(rare)} редких из {len(classes)} классов ===")
 
         texts = [f"{c.name}: {c.description}".strip().rstrip(":") for c in classes]
         vectors = _embed_texts(embed, texts)
@@ -577,7 +665,7 @@ def merge_rare_classes(taxonomy: Taxonomy, auto_confirm: bool = False) -> Taxono
         merged_into: dict[int, int] = {}
         by_index = {id(c): i for i, c in enumerate(classes)}
 
-        for c in rare:
+        for c in tqdm(rare, desc=f"Фаза 2b: '{product}'", unit="класс", leave=False):
             i = by_index[id(c)]
             if i in merged_into:
                 continue
@@ -605,10 +693,10 @@ def merge_rare_classes(taxonomy: Taxonomy, auto_confirm: bool = False) -> Taxono
                 if not decision.is_same_class:
                     continue
 
-                print(f"\n  РЕДКИЙ: {c.name} ({len(c.example_row_ids)} прим.)")
-                print(f"  ВЛИТЬ В: {target.name} ({len(target.example_row_ids)} прим.), "
+                _log(f"\n  РЕДКИЙ: {c.name} ({len(c.example_row_ids)} прим.)")
+                _log(f"  ВЛИТЬ В: {target.name} ({len(target.example_row_ids)} прим.), "
                       f"близость {score:.2f}")
-                print(f"  reasoning: {decision.reasoning}")
+                _log(f"  reasoning: {decision.reasoning}")
                 if auto_confirm:
                     ok = True
                 else:
@@ -621,7 +709,7 @@ def merge_rare_classes(taxonomy: Taxonomy, auto_confirm: bool = False) -> Taxono
                 break  # с этим редким классом закончили
 
         kept = [c for i, c in enumerate(classes) if i not in merged_into]
-        print(f"  → было {len(classes)}, стало {len(kept)}")
+        _log(f"  → было {len(classes)}, стало {len(kept)}")
         result_classes.extend(kept)
 
     return Taxonomy(classes=result_classes)
